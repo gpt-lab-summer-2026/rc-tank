@@ -32,8 +32,8 @@ bottom-centre of the frame. If the car is nose-to-wall when you
 launch it, it learns that the wall is floor and will drive
 straight into things. Give it a metre of clear ground.
 
-Press the reference patch region with --show-patch to see exactly
-what it samples.
+Run with --debug-image to see exactly what it samples: the cyan box
+is the reference patch.
 """
 
 from __future__ import annotations
@@ -133,13 +133,27 @@ def regions(profile: np.ndarray, pct: int = 25) -> tuple[float, float, float]:
 class Policy:
     """Free space in, relay directions out."""
 
-    def __init__(self, go: float, turn_margin: float, stuck_after: float):
+    def __init__(self, go: float, turn_margin: float, stuck_after: float,
+                 reverse_for: float):
         self.go = go                      # centre clearance to keep going
         self.turn_margin = turn_margin    # how much better a side must be
         self.stuck_after = stuck_after
+        self.reverse_for = reverse_for
         self._turning_since = None
+        self._reverse_until = None
 
     def decide(self, left, centre, right, now) -> tuple[int, int]:
+        # A reverse runs for a fixed time and then hands back to the
+        # normal rules. Backing up until the view ahead clears reads
+        # as the sensible version and is not: the camera faces the
+        # other way, so the longer it runs the less anything knows
+        # about where the car is going.
+        if self._reverse_until is not None:
+            if now < self._reverse_until:
+                return (-1, -1)
+            self._reverse_until = None
+            self._turning_since = None    # turning gets a fresh chance
+
         if centre >= self.go:
             self._turning_since = None
             return (1, 1)
@@ -148,6 +162,7 @@ class Policy:
             self._turning_since = now
         elif now - self._turning_since > self.stuck_after:
             # Pivoting has not found a way out. Reverse instead.
+            self._reverse_until = now + self.reverse_for
             return (-1, -1)
 
         # Blocked ahead: spin toward the side with more room. Ties and
@@ -229,18 +244,40 @@ def main() -> int:
                     help="seconds between relay changes")
     ap.add_argument("--stuck-after", type=float, default=3.0,
                     help="seconds of turning before reversing")
+    ap.add_argument("--reverse-for", type=float, default=1.0,
+                    help="seconds to reverse before trying to turn again")
     ap.add_argument("--adapt", type=float, default=0.0,
                     help="floor model blend rate, 0 learns once")
+    ap.add_argument("--command-timeout", type=float, default=None,
+                    help="seconds of silence from this loop before the bridge "
+                         "watchdog is allowed to release the relays "
+                         "(default: five ticks, at least 0.5s)")
+    ap.add_argument("--no-lock-exposure", action="store_true",
+                    help="leave AE/AWB running (the floor model will drift)")
     ap.add_argument("--debug-image", default=None, help="write an annotated frame here")
     args = ap.parse_args()
 
-    cam = Camera()
+    # The floor model is a histogram of colours, learned once. Leaving
+    # auto-exposure and auto-white-balance running means the camera
+    # keeps changing those colours underneath it, and the model rots
+    # over minutes for no reason that appears in any log.
+    cam = Camera(lock_exposure=not args.no_lock_exposure)
+
+    # Tied to the tick rate rather than fixed: too short and a slow
+    # frame drops the motors for no reason, too long and a loop that
+    # has genuinely stopped keeps driving. Five ticks tolerates a
+    # stall without tolerating a death.
+    command_timeout = args.command_timeout
+    if command_timeout is None:
+        command_timeout = max(0.5, 5.0 / args.fps)
+
     car = None
     if not args.dry_run:
         try:
-            car = Car(port=args.port)
-            print(f"bridge on {car.port}")
+            car = Car(port=args.port, command_timeout=command_timeout)
+            print(f"bridge on {car.port}  (releases after {command_timeout:.1f}s silent)")
         except BridgeError as e:
+            cam.close()
             print(f"could not open the bridge: {e}", file=sys.stderr)
             return 1
 
@@ -255,13 +292,13 @@ def main() -> int:
     go_px = args.go * h
     margin_px = args.turn_margin * h
 
-    policy = Policy(go_px, margin_px, args.stuck_after)
+    policy = Policy(go_px, margin_px, args.stuck_after, args.reverse_for)
     smoother = Smoother(args.window, args.min_interval)
 
     period = 1.0 / args.fps
     next_tick = time.monotonic()
     last_debug = 0.0
-    sent = (None, None)
+    last_error = None
 
     try:
         while True:
@@ -279,12 +316,21 @@ def main() -> int:
             raw = policy.decide(*regs, now)
             decision = smoother.update(raw, now)
 
-            if car is not None and decision != sent:
+            # Resent every tick, not only when it changes. The firmware
+            # ignores a state it has already applied, so this costs no
+            # relay operations, and it makes the bridge watchdog track
+            # whether this loop is still running. Send only on change
+            # and a hung loop looks exactly like a healthy one holding
+            # course — which, with nothing watching for a collision, is
+            # the difference between stopping and driving into a wall.
+            if car is not None:
                 try:
                     car.drive(*decision)
-                    sent = decision
+                    last_error = None
                 except BridgeError as e:
-                    print(f"\rbridge error: {e}")
+                    if str(e) != last_error:     # do not flood at 10 Hz
+                        print(f"\rbridge error: {e}")
+                        last_error = str(e)
 
             # Only adapt when the view ahead is clearly open, or the
             # model slowly learns that obstacles are floor.
@@ -341,6 +387,16 @@ if __name__ == "__main__":
 #
 # Dithers in corners
 #   Raise --turn-margin or --min-interval.
+#
+# Backs into things
+#   Lower --reverse-for. Reversing is blind — the camera faces the
+#   other way and there is no rear sensor — so it is capped at a
+#   fixed time rather than run until the way ahead clears.
+#
+# Drifts from working to useless over several minutes
+#   The floor model is colours, learned once. If you passed
+#   --no-lock-exposure, auto-exposure is changing those colours out
+#   from under it. Drop the flag.
 #
 # Circles forever in open space
 #   Lower --go, or check the camera is angled down far enough that

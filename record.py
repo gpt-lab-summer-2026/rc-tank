@@ -3,12 +3,12 @@
 Phase 1 — record camera frames paired with drive commands.
 
 Every frame is saved next to the command being given at that
-moment. Those commands are your training labels.
+moment.
 
-    python3 record.py                    gamepad if present, else keyboard
-    python3 record.py --keyboard         force keyboard
+    python3 record.py                    drive with the keyboard
     python3 record.py --no-car           camera only, nothing moves
     python3 record.py --lock-exposure    fix AE/AWB after warmup
+    python3 record.py --width 640 --height 480
 
 Writes to  dataset/session_YYYYmmdd_HHMMSS/
     frames/000001.jpg ...
@@ -18,20 +18,29 @@ Writes to  dataset/session_YYYYmmdd_HHMMSS/
 Needs car.py in the same directory.
 
     sudo apt install -y python3-picamera2 python3-opencv
-    pip3 install pyserial evdev
+    pip3 install pyserial
 
 -------------------------------------------------------------
-WHY A GAMEPAD
+WHAT THIS IS FOR
 
-Latched keyboard keys make terrible training data. Hold forward
-for eight seconds and you have written 120 identical frames. The
-dataset ends up overwhelmingly "forward", the model learns to
-always go forward, and it scores well while driving into a wall.
+Not training labels. Cloning drive commands does not work on
+roaming data — roam.py's docstring explains why, and that
+argument still holds.
 
-Analogue sticks let you tap and release, so corrections are brief
-and the dataset carries the correction-heavy frames a model needs
-to learn recovery. Watch the live class balance while recording —
-if one class is over about half, go and drive differently.
+These sessions exist so that perception can be replayed offline
+against recorded frames, and so that a floor model has something
+to be trained and measured on. Both want frames, not actions.
+
+Which changes how you should drive. Do not chase class balance.
+Cover ground instead: different rooms, different flooring,
+daylight and lamplight, obstacles near and far. Then drive
+slowly into things on purpose — nothing else in this project
+produces a picture of an obstacle at the moment of contact, and
+those frames are worth more than another lap.
+
+Record at the size roam.py runs at, not the default. Its
+morphology kernels are in pixels, so a half-size frame does not
+behave the same, and replay stops matching what the car did.
 """
 
 from __future__ import annotations
@@ -239,7 +248,10 @@ class GamepadInput:
     def poll(self) -> None:
         ec = self.ecodes
         try:
-            for event in iter(self.dev.read, None):
+            # read_one, not read: read() hands back a generator and
+            # never returns None, so iter()'s sentinel never matches
+            # and the loop yields generators instead of events.
+            for event in iter(self.dev.read_one, None):
                 if event.type == ec.EV_ABS:
                     if event.code == ec.ABS_X:
                         self.steer = self._norm(ec.ABS_X, event.value)
@@ -248,8 +260,8 @@ class GamepadInput:
                         self.throttle = -self._norm(ec.ABS_Y, event.value)
                 elif event.type == ec.EV_KEY and event.value == 1:
                     self.steer = self.throttle = 0.0     # any button stops
-        except BlockingIOError:
-            pass
+        except OSError:
+            pass                          # nothing pending, or it unplugged
 
         self.left, self.right = mix(self.steer, self.throttle, self.deadzone)
 
@@ -343,7 +355,9 @@ def main() -> int:
     ap.add_argument("--width", type=int, default=320, help="saved frame width")
     ap.add_argument("--height", type=int, default=240, help="saved frame height")
     ap.add_argument("--quality", type=int, default=85, help="JPEG quality")
-    ap.add_argument("--keyboard", action="store_true", help="force keyboard input")
+    ap.add_argument("--gamepad", action="store_true",
+                    help="use an analogue gamepad instead of the keyboard "
+                         "(needs evdev; not used by default)")
     ap.add_argument("--no-car", action="store_true", help="do not drive, camera only")
     ap.add_argument("--lock-exposure", action="store_true", help="fix AE/AWB after warmup")
     ap.add_argument(
@@ -354,10 +368,10 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    # Input first — if there is no gamepad we want to know before
-    # spinning up the camera and opening the serial port.
+    # Input first — if the input source is going to fail we want to
+    # know before spinning up the camera and opening the serial port.
     source = None
-    if not args.keyboard:
+    if args.gamepad:
         try:
             source = GamepadInput()
             print("using gamepad")
@@ -365,7 +379,7 @@ def main() -> int:
             print(f"no gamepad ({e}), falling back to keyboard")
     if source is None:
         source = KeyboardInput()
-        print("using keyboard — expect a lopsided class balance")
+        print("using keyboard")
 
     car = None
     if not args.no_car:
@@ -377,7 +391,16 @@ def main() -> int:
             print(f"could not open the bridge: {e}", file=sys.stderr)
             return 1
 
-    cam = Camera(lock_exposure=args.lock_exposure)
+    # KeyboardInput has already put the terminal in cbreak mode, and
+    # Camera bails with SystemExit when picamera2 is missing. Landing
+    # in the shell with cbreak still set leaves it unusable.
+    try:
+        cam = Camera(lock_exposure=args.lock_exposure)
+    except BaseException:
+        source.close()
+        if car is not None:
+            car.close()
+        raise
 
     session = Path(args.out) / datetime.now().strftime("session_%Y%m%d_%H%M%S")
     rec = Recorder(session, (args.width, args.height), args.quality)
@@ -466,8 +489,9 @@ def main() -> int:
             print(f"dropped {rec.dropped} frames — lower --fps or --quality")
         print(f"balance: {rec.balance()}")
         print()
-        print("Aim for no class above roughly half. If forward dominates,")
-        print("record more corrections and recoveries, not more laps.")
+        print("Balance does not matter here — these are not action labels.")
+        print("Coverage does: another room, another floor, another light,")
+        print("and some slow deliberate contacts.")
 
     return 0
 

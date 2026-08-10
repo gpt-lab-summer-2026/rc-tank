@@ -58,6 +58,13 @@ class Car:
 
     Opening the port resets most ESP32 boards, so the constructor
     waits for it to come back before talking to it.
+
+    command_timeout is what makes the firmware watchdog mean anything.
+    Set it, and the keepalive stops refreshing the bridge once that
+    many seconds have passed without a command from the caller, so a
+    control loop that hangs takes the motors down with it. Leave it
+    None and the keepalive holds the last state indefinitely, which is
+    what you want when a human is driving and nothing else is.
     """
 
     def __init__(
@@ -67,6 +74,7 @@ class Car:
         timeout: float = 0.3,
         keepalive: bool = True,
         boot_delay: float = 2.0,
+        command_timeout: Optional[float] = None,
     ):
         port = port or find_port()
         if port is None:
@@ -79,14 +87,19 @@ class Car:
         time.sleep(boot_delay)            # board resets when the port opens
         self._ser.reset_input_buffer()
 
-        self._last_tx = time.monotonic()
-        self._watchdog_s = 0.4
+        now = time.monotonic()
+        self._last_tx = now
+        self._last_command_at = now
+        self._last_state: Optional[tuple[int, int, int, int]] = None
+        self._command_timeout = command_timeout
+        self._watchdog_s = 0.4            # replaced by what the bridge reports
         self._stop_evt = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
         info = self.info()
         if "bridge" not in info:
             raise BridgeError(f"unexpected greeting: {info!r}")
+        self._note_watchdog(info)
 
         if keepalive:
             self._thread = threading.Thread(
@@ -112,27 +125,63 @@ class Car:
             raise BridgeError(f"{line!r} -> {reply}")
         return reply
 
+    def _note_watchdog(self, info_line: str) -> None:
+        """Track the bridge's watchdog, so the keepalive can outpace it."""
+        for field in info_line.split():
+            if field.startswith("watchdog="):
+                try:
+                    self._watchdog_s = int(field.split("=")[1]) / 1000.0
+                except ValueError:
+                    pass
+
+    def _caller_is_alive(self) -> bool:
+        """Has whoever owns this Car issued a command recently?"""
+        if self._command_timeout is None:
+            return True
+        return time.monotonic() - self._last_command_at <= self._command_timeout
+
     def _keepalive(self) -> None:
-        """Ping when idle, so the firmware watchdog never fires.
+        """Refresh the bridge when idle — but only while the caller lives.
 
         Without this, a slow inference step between commands looks
         to the ESP32 like the Pi has gone away.
+
+        The catch is that a thread which refreshes regardless of what
+        the rest of the program is doing defeats the watchdog it is
+        working around. Nothing on this car watches for a collision,
+        so the watchdog releasing the relays is the only thing between
+        a hung control loop and driving until something stops it. Hence
+        command_timeout: past it, this goes quiet and lets the watchdog
+        do its job.
+
+        It resends the last commanded state rather than a bare ping.
+        The firmware ignores a state it has already applied, so this
+        costs no contact operations, and a bridge that reset underneath
+        us comes back doing what it was last told.
         """
         while not self._stop_evt.is_set():
-            if self._watchdog_s > 0:
+            state = self._last_state
+            if self._watchdog_s > 0 and state is not None and self._caller_is_alive():
                 idle = time.monotonic() - self._last_tx
                 if idle > self._watchdog_s / 3:
                     try:
-                        self._send("P")
+                        self._apply(state)
                     except Exception:
                         pass              # close() will surface real failures
             self._stop_evt.wait(0.05)
 
     # ----------------------------------------------------- commands
 
+    def _apply(self, state: tuple[int, int, int, int]) -> str:
+        """Send a relay state without it counting as caller activity."""
+        return self._send("R {} {} {} {}".format(*state))
+
     def relays(self, a: int, b: int, c: int, d: int) -> str:
         """Set IN1..IN4 directly. Returns the applied state line."""
-        return self._send(f"R {int(a)} {int(b)} {int(c)} {int(d)}")
+        state = (int(a), int(b), int(c), int(d))
+        self._last_state = state
+        self._last_command_at = time.monotonic()
+        return self._apply(state)
 
     def drive(self, left: int, right: int) -> str:
         """Set each motor to -1 (reverse), 0 (stop) or +1 (forward)."""
@@ -163,6 +212,8 @@ class Car:
         return self.drive(1, 0)
 
     def stop(self) -> str:
+        self._last_state = (0, 0, 0, 0)
+        self._last_command_at = time.monotonic()
         return self._send("S")
 
     def ping(self) -> str:
@@ -203,9 +254,7 @@ class Car:
         if active_low is not None:
             reply = self._send(f"C A {1 if active_low else 0}")
 
-        for field in reply.split():
-            if field.startswith("watchdog="):
-                self._watchdog_s = int(field.split("=")[1]) / 1000.0
+        self._note_watchdog(reply)
         return reply
 
     # ----------------------------------------------------- lifecycle
