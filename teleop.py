@@ -7,6 +7,7 @@ watchdog all work before any camera or model is involved.
 
     python3 teleop.py
     python3 teleop.py --port /dev/ttyUSB0
+    python3 teleop.py --selftest        click each relay (motors off!)
 
 Keep car.py in the same directory.
 
@@ -21,6 +22,7 @@ import os
 import select
 import sys
 import termios
+import time
 import tty
 
 from car import Car, BridgeError, boot_warning
@@ -73,9 +75,73 @@ def read_keys(timeout: float = 0.1) -> str:
     return os.read(sys.stdin.fileno(), 64).decode(errors="replace")
 
 
+def relay_ops(info_line: str) -> list[int]:
+    """Per-relay actuation counts out of an info reply."""
+    for field in info_line.split():
+        if field.startswith("ops="):
+            try:
+                return [int(x) for x in field[4:].split(",")]
+            except ValueError:
+                break
+    return []
+
+
+def selftest(car: Car) -> int:
+    """Click each relay on its own, with a human as the sensor.
+
+    Nothing reports back from the contacts, so the firmware cannot
+    tell a relay that opened from one that welded shut. It can only
+    energise them one at a time and leave you to listen. Four relays,
+    four clicks, four releases. A relay that stays silent is stuck,
+    and a stuck relay is what keeps a tank driving after it has been
+    told to stop.
+    """
+    print("\n  DISCONNECT THE MOTOR BATTERY FIRST.")
+    print("  This energises relays on purpose. With motors attached,")
+    print("  the tank will move.\n")
+    try:
+        input("  Motors disconnected? Enter to run, ctrl-c to abort. ")
+    except (KeyboardInterrupt, EOFError):
+        print("\n  aborted")
+        return 1
+
+    before = relay_ops(car.info())
+    print()
+
+    for i in range(4):
+        state = [0, 0, 0, 0]
+        state[i] = 1
+        print(f"  relay {i + 1} (IN{i + 1})   energise ...", end="", flush=True)
+        car.relays(*state)
+        time.sleep(0.6)
+        print(" release ...", end="", flush=True)
+        car.relays(0, 0, 0, 0)
+        time.sleep(0.5)
+        print(" done")
+
+    after = relay_ops(car.info())
+    print()
+    if before and after and len(before) == len(after) == 4:
+        print("  lifetime operations, per relay:")
+        for i, (b, a) in enumerate(zip(before, after)):
+            print(f"    IN{i + 1}  {a:6d}   (+{a - b} this test)")
+        print()
+        print("  Contacts are a consumable. Log these each session — welding")
+        print("  gets likelier as they climb, and nothing warns you first.")
+        print()
+
+    print("  You should have heard EIGHT clicks: four energise, four release.")
+    print("  A relay that never clicked, or clicked once and not again, is")
+    print("  stuck. With the motor battery still disconnected, meter COM to")
+    print("  NO on that relay — it must read open. Continuity means welded.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", default=None, help="serial device")
+    ap.add_argument("--selftest", action="store_true",
+                    help="click each relay in turn, then stop (motors off!)")
     args = ap.parse_args()
 
     try:
@@ -90,6 +156,12 @@ def main() -> int:
     warning = boot_warning(car.boot_reason)
     if warning:
         print(f"\n  !! {warning}\n")
+
+    if args.selftest:
+        try:
+            return selftest(car)
+        finally:
+            car.close()
 
     print(HELP)
 

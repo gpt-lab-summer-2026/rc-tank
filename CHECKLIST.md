@@ -72,22 +72,38 @@ zero crossing. Relay DC ratings assume resistive loads; against a
 motor the real capability is far lower. These contacts were always
 going to erode. The open question is only how fast.
 
-### Do — pin down which failure it is
-- [ ] Reflash with the updated firmware (adds relay operation counts)
-- [ ] Reproduce the runaway, then press **space** and read the status line
-- [ ] ⛔ **If it shows `relays[0 0 0 0]` while the tracks turn, the fault
-      is mechanical.** Firmware is exonerated; stop debugging software.
-- [ ] With it stuck, measure the ESP32 pin for the suspect relay
-      (GPIO 27/26/25/33) against ground:
-      - **~3.3 V** → the ESP32 is releasing it. Fault is the board or contacts.
-      - **~0 V** → still being driven on. Fault is upstream after all.
-- [ ] Measure across the stuck relay's **coil**:
-      - **No voltage, relay still closed** → welded contacts.
-      - **Voltage present** → the coil driver transistor has latched on.
-- [ ] Press `i` and note `ops=` — the actuation count per relay. Log it
-      each session; welding onset should correlate with a high count
-- [ ] Check whether the board has flyback diodes across each coil.
-      Without them the driver eats the kickback and eventually shorts
+### Confirmed so far
+- [x] `relays[0 0 0 0]` displayed while the tracks were still turning
+
+Firmware and power are both exonerated. With every relay
+de-energised, all four motor terminals should sit at battery
+negative — same potential both ends, no current, motors braked. They
+ran anyway, so either a contact is not opening, or the wiring differs
+from the diagram.
+
+### Do — separate those two, no multimeter needed
+- [ ] ⛔ **Unplug the ESP32 (USB) with the motor battery connected.**
+      Every relay is now at rest whatever the firmware thinks.
+      - **Motors run** → the *rest state* drives them. Wiring fault:
+        a swapped NO/NC, a loose lead, or a short bypassing a contact.
+        No contact is stuck at all.
+      - **Motors stay still** → rest wiring is correct, so during the
+        runaway something held a contact closed. Weld or latched driver.
+- [ ] Swap the two motors between relay pairs and reproduce. Fault
+      follows the **motor** → wiring or a short on that motor's leads.
+      Fault stays with the **relay pair** → that pair is at fault.
+
+### Do — with the motor battery disconnected
+- [ ] `python3 teleop.py --selftest` — energises each relay alone.
+      Listen for eight clicks: four on, four off. A silent one is stuck
+- [ ] Meter **COM to NO** on each relay, de-energised. It must read
+      open. Continuity means that contact is welded
+- [ ] Meter **COM to NC** on each relay, de-energised. It must read
+      closed, and NC must go to battery **negative** on all four —
+      one swapped pair is enough to drive a motor at rest
+- [ ] Tug every motor and battery lead. Intermittent faults on a
+      vibrating tracked chassis are usually a wire, not a component
+- [ ] Note the `ops=` counts from the selftest and log them each session
 
 ### Do — reduce the damage rate
 Contacts cannot be un-welded, and no firmware change avoids breaking
