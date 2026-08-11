@@ -21,6 +21,10 @@
      NO  -> battery +    (all four)
      NC  -> battery -    (all four)
 
+   On this build motor 1 (IN1/IN2) is the RIGHT track and motor 2
+   (IN3/IN4) is the LEFT. The firmware neither knows nor cares —
+   car.py hands the sides over to match. See SWAP_SIDES there.
+
    Pi connects over USB. 115200 baud.
 
    TWO RULES THAT KEEP A DEAD ESP32 FROM DRIVING THE MOTORS

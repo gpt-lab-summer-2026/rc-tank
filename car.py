@@ -13,6 +13,9 @@ the car drives is decided here.
         time.sleep(0.5)
         car.stop()
 
+If a turn comes out mirrored, the sides are wired the other way
+round to what the code assumes — see SWAP_SIDES below.
+
 Needs pyserial:  pip install pyserial
 """
 
@@ -87,6 +90,23 @@ def find_port() -> Optional[str]:
 # Per motor: +1 forward, 0 stop, -1 reverse -> (relay A, relay B)
 _DIR = {1: (1, 0), 0: (0, 0), -1: (0, 1)}
 
+# ------------------------------------------------------------------
+# WHICH RELAY PAIR IS WHICH TRACK
+#
+# The firmware calls IN1/IN2 "motor 1" and IN3/IN4 "motor 2". On this
+# tank motor 1 is the RIGHT track, so drive(left, right) has to hand
+# its arguments over the other way round.
+#
+# Without the swap, forward and backward still look perfectly correct
+# — both tracks get the same command — and only turns come out
+# mirrored. That is what makes this worth a named constant rather
+# than a quiet fix: the symptom points at the steering logic, and the
+# cause is two connectors.
+#
+# Set False if the motor leads are ever swapped at the relay board,
+# which fixes the same problem in copper.
+SWAP_SIDES = True
+
 
 class Car:
     """Serial link to the relay bridge.
@@ -111,6 +131,7 @@ class Car:
         boot_delay: float = 2.0,
         command_timeout: Optional[float] = None,
         command_cooldown: float = 0.0,
+        swap_sides: bool = SWAP_SIDES,
         on_event: Optional[Callable[[str], None]] = _default_event,
     ):
         port = port or find_port()
@@ -147,6 +168,8 @@ class Car:
         self.held = 0
         self.last_command_held = False
         self._changed_at = 0.0
+
+        self.swap_sides = swap_sides
         self._watchdog_s = 0.4            # replaced by what the bridge reports
         self._stop_evt = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -346,9 +369,15 @@ class Car:
         return self._set((int(a), int(b), int(c), int(d)))
 
     def drive(self, left: int, right: int) -> str:
-        """Set each motor to -1 (reverse), 0 (stop) or +1 (forward)."""
+        """Set each track to -1 (reverse), 0 (stop) or +1 (forward).
+
+        left and right mean the tank's own left and right. See
+        SWAP_SIDES for how those reach the relay pairs.
+        """
         if left not in _DIR or right not in _DIR:
             raise ValueError("left and right must be -1, 0 or 1")
+        if self.swap_sides:
+            left, right = right, left
         a, b = _DIR[left]
         c, d = _DIR[right]
         return self.relays(a, b, c, d)
