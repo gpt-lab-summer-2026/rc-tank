@@ -23,14 +23,30 @@
 
    Pi connects over USB. 115200 baud.
 
-   FIT A 10k PULL-UP FROM EACH OF IN1..IN4 TO 3V3.
+   TWO RULES THAT KEEP A DEAD ESP32 FROM DRIVING THE MOTORS
 
-   Between the moment this chip resets and the first line of
-   setup() below, its pins are floating inputs. On an active-low
-   board a floating input can read as "on", which holds the relays
-   closed while no code is running to release them. Firmware cannot
-   close that window — only the pull-ups can. Without them, a
-   brownout can leave the motors driving with nothing in control.
+   1. FIT A 10k PULL-UP FROM EACH OF IN1..IN4 TO 3V3.
+
+      Between the moment this chip resets and the first line of
+      setup() below, its pins are floating inputs. On an active-low
+      board a floating input can read as "on", holding the relays
+      closed while no code is running to release them. Firmware
+      cannot close that window — only the pull-ups can.
+
+   2. KEEP THE COILS ON THE SAME 5V AS THIS CHIP.
+
+      Tempting to give the coils their own supply, since their
+      switching noise is what sags this one. Do not. Sharing a rail
+      means losing it releases the relays: no logic, no coils, motors
+      stop. Split the rails and a chip that dies while the coil
+      supply lives leaves the relays latched with nothing driving
+      them — which is the failure this whole note exists to prevent.
+
+      Fix the noise with capacitance, not with separation.
+
+   Rule 1 covers a reset or a hang, where 3V3 is still up. Rule 2
+   covers losing 5V altogether. Both are needed; neither is enough
+   on its own.
 
    -------------------------------------------------------------
    PROTOCOL — one line in, one line out, always
@@ -119,7 +135,16 @@ Pair pairs[2] = {
 
 // ---------------------------- relays ----------------------------
 
+// Every actuation is counted. Contacts are a consumable — they weld
+// eventually, and a welded contact keeps driving a motor after the
+// coil has let go. Knowing how many operations each one has done is
+// the only warning you get, since nothing here can sense a weld.
+bool coilState[4] = {false, false, false, false};
+unsigned long relayOps[4] = {0, 0, 0, 0};
+
 inline void coil(int idx, bool on) {
+  if (coilState[idx] != on) relayOps[idx]++;
+  coilState[idx] = on;
   digitalWrite(PIN_IN[idx], on == activeLow ? LOW : HIGH);
 }
 
@@ -194,9 +219,10 @@ void replyOk() {
 void replyInfo() {
   Serial.printf(
     "info bridge=1 deadtime=%lu watchdog=%lu activelow=%d stagger=%lu "
-    "boot=%s up=%lu\n",
+    "boot=%s up=%lu ops=%lu,%lu,%lu,%lu\n",
     deadtimeMs, watchdogMs, activeLow ? 1 : 0, staggerMs,
-    resetReasonName(bootReason), millis());
+    resetReasonName(bootReason), millis(),
+    relayOps[0], relayOps[1], relayOps[2], relayOps[3]);
 }
 
 // ---------------------------- parsing ----------------------------

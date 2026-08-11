@@ -42,9 +42,13 @@ HELP = """
   q  arc left       e  arc right
 
   space  stop       x  quit
-  i      show firmware config
+  i      show firmware config, including relay operation counts
 
 Commands latch until you press another key.
+
+relays[...] is what the bridge reports as APPLIED. Pressing space
+should show relays[0 0 0 0]. If it does and the tracks keep turning,
+a contact has welded shut and no key will help — cut the motor power.
 """
 
 
@@ -108,13 +112,24 @@ def main() -> int:
 
                 label, (left, right) = KEYS[key]
                 try:
-                    car.drive(left, right)
+                    reply = car.drive(left, right)
                 except BridgeError as e:
                     print(f"\rerror: {e}")
                     continue
 
+                # Show what the bridge says is APPLIED, not what was
+                # asked for. If this reads 0 0 0 0 while the tracks are
+                # still turning, the firmware did as it was told and the
+                # fault is a contact that will not open — nothing in
+                # software can help, so stop looking there.
+                applied = " ".join(reply.split()[1:5])
+
                 # \r and padding keep the status on one line in cbreak mode
-                print(f"\r{label:<12} left={left:+d} right={right:+d}   ", end="")
+                print(
+                    f"\r{label:<12} left={left:+d} right={right:+d}"
+                    f"  relays[{applied}]   ",
+                    end="",
+                )
                 sys.stdout.flush()
 
     except KeyboardInterrupt:
