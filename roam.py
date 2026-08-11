@@ -252,6 +252,9 @@ def main() -> int:
                     help="seconds of silence from this loop before the bridge "
                          "watchdog is allowed to release the relays "
                          "(default: five ticks, at least 0.5s)")
+    ap.add_argument("--cooldown", type=float, default=2.0,
+                    help="seconds between relay direction changes; decisions "
+                         "inside this window are retried, not dropped")
     ap.add_argument("--no-lock-exposure", action="store_true",
                     help="leave AE/AWB running (the floor model will drift)")
     ap.add_argument("--debug-image", default=None, help="write an annotated frame here")
@@ -274,7 +277,8 @@ def main() -> int:
     car = None
     if not args.dry_run:
         try:
-            car = Car(port=args.port, command_timeout=command_timeout)
+            car = Car(port=args.port, command_timeout=command_timeout,
+                      command_cooldown=args.cooldown)
             print(f"bridge on {car.port}  (releases after {command_timeout:.1f}s silent)")
             warning = boot_warning(car.boot_reason)
             if warning:
@@ -345,6 +349,8 @@ def main() -> int:
             # a car that is being driven and one that is coasting on
             # its last order, and you want to see that as it happens.
             resets = f"  RESETS {car.resets}" if car is not None and car.resets else ""
+            if car is not None and car.last_command_held:
+                resets += f"  HELD {car.cooldown_remaining():.1f}s"
             print(
                 f"\rL {regs[0]:5.0f}  C {regs[1]:5.0f}  R {regs[2]:5.0f}   "
                 f"go>{go_px:.0f}   {label_of(*decision):<12}{resets}",
@@ -400,6 +406,18 @@ if __name__ == "__main__":
 #   Lower --reverse-for. Reversing is blind — the camera faces the
 #   other way and there is no rear sensor — so it is capped at a
 #   fixed time rather than run until the way ahead clears.
+#
+# Sees the obstacle, decides to turn, and hits it anyway
+#   Look at --cooldown before anything else. It defaults to 2s
+#   because the contacts need that long to settle under teleop, and
+#   during it the car holds its last direction no matter what the
+#   camera says. Two seconds at 0.4 m/s is 80 cm of committed
+#   travel, which is further than this can see in front of itself.
+#
+#   Perception cannot fix that; it is not a perception problem. Cut
+#   --cooldown as far as the relays tolerate, and cut the speed to
+#   match whatever is left. HELD in the status line shows when a
+#   decision is being sat on.
 #
 # Drifts from working to useless over several minutes
 #   The floor model is colours, learned once. If you passed

@@ -44,13 +44,21 @@ HELP = """
   q  arc left       e  arc right
 
   space  stop       x  quit
-  i      show firmware config, including relay operation counts
+  r      unstick    i  show config and relay operation counts
 
 Commands latch until you press another key.
 
+Direction changes are rate limited (--cooldown). A press inside that
+window shows HELD and does nothing — the contacts need the time, and
+spamming keys only leaves the state chasing itself. Space is never
+held.
+
+r drives backwards briefly, then stops. That clears a relay that has
+stayed engaged, usually after an arc. Expect the rover to move.
+
 relays[...] is what the bridge reports as APPLIED. Pressing space
 should show relays[0 0 0 0]. If it does and the tracks keep turning,
-a contact has welded shut and no key will help — cut the motor power.
+try r. If that does not free it either, cut the motor power.
 """
 
 
@@ -142,10 +150,15 @@ def main() -> int:
     ap.add_argument("--port", default=None, help="serial device")
     ap.add_argument("--selftest", action="store_true",
                     help="click each relay in turn, then stop (motors off!)")
+    ap.add_argument("--cooldown", type=float, default=2.0,
+                    help="seconds between direction changes; presses inside "
+                         "this window are held (0 disables)")
+    ap.add_argument("--unstick-time", type=float, default=0.5,
+                    help="seconds to drive backwards when r is pressed")
     args = ap.parse_args()
 
     try:
-        car = Car(port=args.port)
+        car = Car(port=args.port, command_cooldown=args.cooldown)
     except BridgeError as e:
         print(f"could not open the bridge: {e}", file=sys.stderr)
         return 1
@@ -179,6 +192,15 @@ def main() -> int:
                 if key == "i":
                     print("\r" + car.info())
                     continue
+                if key == "r":
+                    print("\runsticking — reversing briefly ...", end="")
+                    sys.stdout.flush()
+                    try:
+                        car.unstick(args.unstick_time)
+                        print(" done, stopped        ")
+                    except BridgeError as e:
+                        print(f"\rerror: {e}")
+                    continue
                 if key not in KEYS:
                     continue
 
@@ -192,16 +214,18 @@ def main() -> int:
                 # Show what the bridge says is APPLIED, not what was
                 # asked for. If this reads 0 0 0 0 while the tracks are
                 # still turning, the firmware did as it was told and the
-                # fault is a contact that will not open — nothing in
-                # software can help, so stop looking there.
+                # fault is a contact that will not open.
                 applied = " ".join(reply.split()[1:5])
 
+                if car.last_command_held:
+                    # Say why nothing happened. A key that appears to do
+                    # nothing is indistinguishable from a broken one.
+                    status = f"HELD {car.cooldown_remaining():.1f}s   "
+                else:
+                    status = f"{label:<12} left={left:+d} right={right:+d}"
+
                 # \r and padding keep the status on one line in cbreak mode
-                print(
-                    f"\r{label:<12} left={left:+d} right={right:+d}"
-                    f"  relays[{applied}]   ",
-                    end="",
-                )
+                print(f"\r{status}  relays[{applied}]      ", end="")
                 sys.stdout.flush()
 
     except KeyboardInterrupt:

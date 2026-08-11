@@ -74,6 +74,27 @@ going to erode. The open question is only how fast.
 
 ### Confirmed so far
 - [x] `relays[0 0 0 0]` displayed while the tracks were still turning
+- [x] Relays stick most often **after an arc command**
+- [x] A short burst of **reverse frees them**, and driving resumes normally
+- [x] Commands arriving faster than the contacts settle leave the state
+      chasing itself
+
+**Mitigations now in software** — a workaround, not a cure. The
+contacts still stick; these make it recoverable without touching the
+hardware.
+
+- 2 s cooldown between direction changes (`--cooldown`). Presses
+  inside the window show `HELD` and change nothing. Held commands
+  still resend the *current* state, so the watchdog never mistakes a
+  rate-limited operator for a dead one.
+- `r` in teleop runs the reverse-then-stop jolt. Stop and unstick are
+  never rate limited.
+- Per-relay `ops=` counters, so contact wear is tracked.
+
+The cooldown costs reaction time, which matters from Phase 2 onward:
+2 s at 0.4 m/s is 80 cm of committed travel, further than the camera
+can see ahead. Perception cannot compensate — see the `--cooldown`
+entry in `roam.py`'s TUNING block.
 
 Firmware and power are both exonerated. With every relay
 de-energised, all four motor terminals should sit at battery
