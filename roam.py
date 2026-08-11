@@ -46,7 +46,7 @@ from collections import Counter, deque
 import cv2
 import numpy as np
 
-from car import BridgeError, Car
+from car import BridgeError, Car, boot_warning
 from record import Camera, label_of
 
 # ------------------------------------------------------- floor model
@@ -276,6 +276,9 @@ def main() -> int:
         try:
             car = Car(port=args.port, command_timeout=command_timeout)
             print(f"bridge on {car.port}  (releases after {command_timeout:.1f}s silent)")
+            warning = boot_warning(car.boot_reason)
+            if warning:
+                print(f"\n  !! {warning}\n")
         except BridgeError as e:
             cam.close()
             print(f"could not open the bridge: {e}", file=sys.stderr)
@@ -337,9 +340,14 @@ def main() -> int:
             if args.adapt > 0 and regs[1] > go_px * 1.2:
                 floor.learn(frame)
 
+            # Restarts are shown inline rather than only at the end.
+            # A bridge that reboots mid-run is the difference between
+            # a car that is being driven and one that is coasting on
+            # its last order, and you want to see that as it happens.
+            resets = f"  RESETS {car.resets}" if car is not None and car.resets else ""
             print(
                 f"\rL {regs[0]:5.0f}  C {regs[1]:5.0f}  R {regs[2]:5.0f}   "
-                f"go>{go_px:.0f}   {label_of(*decision):<12}",
+                f"go>{go_px:.0f}   {label_of(*decision):<12}{resets}",
                 end="",
             )
             sys.stdout.flush()

@@ -18,14 +18,49 @@ Needs pyserial:  pip install pyserial
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import serial
 from serial.tools import list_ports
 
-__all__ = ["Car", "BridgeError", "find_port"]
+__all__ = ["Car", "BridgeError", "find_port", "boot_warning"]
+
+# Opening the serial port resets most ESP32 boards, so one of these
+# is expected at the start of every run.
+_NORMAL_BOOT = ("power-on", "external-pin", "software")
+
+
+def boot_warning(reason: Optional[str]) -> Optional[str]:
+    """Say something if the bridge's last restart was not routine.
+
+    Anything outside _NORMAL_BOOT happened on its own. On this
+    hardware that almost always means the motors pulled the supply
+    down far enough to take the ESP32 with them.
+    """
+    if not reason or reason in _NORMAL_BOOT:
+        return None
+    if reason == "BROWNOUT":
+        return (
+            "bridge last restarted from BROWNOUT — the supply sagged far enough\n"
+            "  to reset the ESP32. While it reboots nothing is driving the relay\n"
+            "  pins, so the motors hold whatever they were last given and no\n"
+            "  watchdog is running to release them. Fit the 10k pull-ups, and\n"
+            "  stop powering the relay coils from the same 5V as the ESP32."
+        )
+    return f"bridge last restarted from {reason} — it did not do that on request."
+
+
+def _default_event(msg: str) -> None:
+    """Where bridge events go when nobody says otherwise.
+
+    Loud on purpose. These are the lines that tell you the ESP32
+    restarted underneath you, and the previous version of this file
+    threw them away before anyone could read them.
+    """
+    print(f"\n[bridge] {msg}", file=sys.stderr, flush=True)
 
 
 class BridgeError(RuntimeError):
@@ -75,6 +110,7 @@ class Car:
         keepalive: bool = True,
         boot_delay: float = 2.0,
         command_timeout: Optional[float] = None,
+        on_event: Optional[Callable[[str], None]] = _default_event,
     ):
         port = port or find_port()
         if port is None:
@@ -82,24 +118,38 @@ class Car:
 
         self.port = port
         self._lock = threading.Lock()
+
+        # Anything the bridge says without being asked, and a count of
+        # how many times it has restarted. A restart mid-session is the
+        # single most useful thing this class can tell you.
+        self.on_event = on_event
+        self.events: list[str] = []
+        self.resets = 0
+        self.boot_reason: Optional[str] = None
+
         self._ser = serial.Serial(port, baud, timeout=timeout)
 
         time.sleep(boot_delay)            # board resets when the port opens
-        self._ser.reset_input_buffer()
 
         now = time.monotonic()
         self._last_tx = now
         self._last_command_at = now
         self._last_state: Optional[tuple[int, int, int, int]] = None
+        self._last_uptime: Optional[int] = None
         self._command_timeout = command_timeout
         self._watchdog_s = 0.4            # replaced by what the bridge reports
         self._stop_evt = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
+        # The boot banner is sitting in the buffer right now. Read it
+        # rather than flushing it — resets is meant to count restarts
+        # that happen while running, not the one we just caused.
+        self._drain_async()
+        self.resets = 0
+
         info = self.info()
         if "bridge" not in info:
             raise BridgeError(f"unexpected greeting: {info!r}")
-        self._note_watchdog(info)
 
         if keepalive:
             self._thread = threading.Thread(
@@ -109,30 +159,106 @@ class Car:
 
     # ---------------------------------------------------------- io
 
-    def _send(self, line: str) -> str:
+    # Lines the bridge sends unprompted. They start with their own
+    # words precisely so a restart cannot be mistaken for the answer
+    # to whatever was sent a moment earlier.
+    _ASYNC = ("boot", "evt")
+
+    def _emit(self, msg: str) -> None:
+        self.events.append(msg)
+        if self.on_event is not None:
+            self.on_event(msg)
+
+    def _note_async(self, line: str) -> None:
+        if line.startswith("boot"):
+            self.resets += 1
+            self._emit(f"*** BRIDGE RESTARTED *** {line}")
+        elif line.startswith("evt"):
+            self._emit(line)
+        else:
+            self._emit(f"unexpected line: {line!r}")
+
+    def _drain_async(self) -> None:
+        """Read whatever is already waiting. Caller holds the lock."""
+        while self._ser is not None and self._ser.in_waiting:
+            stray = self._ser.readline().decode(errors="replace").strip()
+            if stray:
+                self._note_async(stray)
+
+    def _note_uptime(self, reply: str) -> None:
+        """Catch a restart the boot banner did not tell us about.
+
+        The banner can be missed — swallowed by a flush, mangled by
+        line noise, or sent while nothing was reading. Uptime cannot
+        be missed: it only ever counts up, so it counting down means
+        the chip started again.
+        """
+        for field in reply.split():
+            if not field.startswith("up="):
+                continue
+            try:
+                up = int(field[3:])
+            except ValueError:
+                return
+            if self._last_uptime is not None and up < self._last_uptime:
+                self.resets += 1
+                self._emit(
+                    f"*** BRIDGE RESTARTED *** uptime went "
+                    f"{self._last_uptime} -> {up} ms (banner missed)"
+                )
+            self._last_uptime = up
+            return
+
+    def _send(self, line: str, expect: str = "ok") -> str:
         with self._lock:
             if self._ser is None:
                 raise BridgeError("port is closed")
-            self._ser.reset_input_buffer()
-            self._ser.write((line + "\n").encode())
-            self._ser.flush()
-            reply = self._ser.readline().decode(errors="replace").strip()
-            self._last_tx = time.monotonic()
+            try:
+                # Whatever is already waiting was not asked for, so it
+                # is either a restart or a watchdog notice. Both are
+                # worth more than the microsecond saved by discarding
+                # them, which is what this used to do.
+                self._drain_async()
+
+                self._ser.write((line + "\n").encode())
+                self._ser.flush()
+
+                reply = ""
+                for _ in range(5):
+                    reply = self._ser.readline().decode(errors="replace").strip()
+                    if not reply:
+                        break
+                    if reply.startswith(self._ASYNC):
+                        self._note_async(reply)
+                        continue          # that was not the reply, keep reading
+                    break
+                self._last_tx = time.monotonic()
+            except serial.SerialException as e:
+                # pyserial raises this, not BridgeError, so without
+                # this every caller's `except BridgeError` misses an
+                # unplugged cable entirely.
+                raise BridgeError(f"serial link failed: {e}") from e
 
         if not reply:
             raise BridgeError(f"no reply to {line!r}")
         if reply.startswith("err"):
             raise BridgeError(f"{line!r} -> {reply}")
+        if not reply.startswith(expect):
+            raise BridgeError(f"{line!r} -> wanted {expect!r}, got {reply!r}")
+        self._note_uptime(reply)
         return reply
 
-    def _note_watchdog(self, info_line: str) -> None:
-        """Track the bridge's watchdog, so the keepalive can outpace it."""
+    def _note_info(self, info_line: str) -> None:
+        """Pick the settings we care about out of an info reply."""
         for field in info_line.split():
-            if field.startswith("watchdog="):
+            key, _, val = field.partition("=")
+            if key == "watchdog":
                 try:
-                    self._watchdog_s = int(field.split("=")[1]) / 1000.0
+                    self._watchdog_s = int(val) / 1000.0
                 except ValueError:
                     pass
+            elif key == "boot":
+                self.boot_reason = val
 
     def _caller_is_alive(self) -> bool:
         """Has whoever owns this Car issued a command recently?"""
@@ -231,30 +357,36 @@ class Car:
     # ------------------------------------------------------- config
 
     def info(self) -> str:
-        return self._send("?")
+        reply = self._send("?", expect="info")
+        self._note_info(reply)
+        return reply
 
     def config(
         self,
         deadtime_ms: Optional[int] = None,
         watchdog_ms: Optional[int] = None,
         active_low: Optional[bool] = None,
+        stagger_ms: Optional[int] = None,
     ) -> str:
         """Change firmware behaviour at runtime — no reflashing.
 
         deadtime_ms=0 lets reversals happen instantly, so sequence
         the stop yourself if you still want one.
         watchdog_ms=0 means a crash here leaves the motors running.
+        stagger_ms starts the two motors that many milliseconds
+        apart, so their inrush does not land on the rail at once.
         """
         reply = self.info()
         if deadtime_ms is not None:
-            reply = self._send(f"C D {int(deadtime_ms)}")
+            reply = self._send(f"C D {int(deadtime_ms)}", expect="info")
         if watchdog_ms is not None:
-            reply = self._send(f"C W {int(watchdog_ms)}")
-            self._watchdog_s = watchdog_ms / 1000.0
+            reply = self._send(f"C W {int(watchdog_ms)}", expect="info")
         if active_low is not None:
-            reply = self._send(f"C A {1 if active_low else 0}")
+            reply = self._send(f"C A {1 if active_low else 0}", expect="info")
+        if stagger_ms is not None:
+            reply = self._send(f"C S {int(stagger_ms)}", expect="info")
 
-        self._note_watchdog(reply)
+        self._note_info(reply)
         return reply
 
     # ----------------------------------------------------- lifecycle

@@ -48,6 +48,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import queue
 import select
 import sys
@@ -194,12 +195,19 @@ class KeyboardInput:
         tty.setcbreak(self._fd)
 
     def poll(self) -> None:
+        # os.read on the descriptor, not sys.stdin.read: the buffered
+        # reader swallows the rest of a chunk where select() cannot
+        # see it, and those keys then go unnoticed until the next one
+        # arrives. Losing a stop that way is not acceptable.
         while select.select([sys.stdin], [], [], 0)[0]:
-            key = sys.stdin.read(1).lower()
-            if key == "x":
-                self.quit = True
-            elif key in self.KEYS:
-                self.left, self.right = self.KEYS[key]
+            chunk = os.read(self._fd, 64).decode(errors="replace")
+            if not chunk:
+                break
+            for key in chunk.lower():
+                if key == "x":
+                    self.quit = True
+                elif key in self.KEYS:
+                    self.left, self.right = self.KEYS[key]
 
     def close(self) -> None:
         termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)

@@ -23,6 +23,15 @@
 
    Pi connects over USB. 115200 baud.
 
+   FIT A 10k PULL-UP FROM EACH OF IN1..IN4 TO 3V3.
+
+   Between the moment this chip resets and the first line of
+   setup() below, its pins are floating inputs. On an active-low
+   board a floating input can read as "on", which holds the relays
+   closed while no code is running to release them. Firmware cannot
+   close that window — only the pull-ups can. Without them, a
+   brownout can leave the motors driving with nothing in control.
+
    -------------------------------------------------------------
    PROTOCOL — one line in, one line out, always
 
@@ -33,19 +42,31 @@
      C D <ms>      dead-time, 0 disables
      C W <ms>      watchdog, 0 disables
      C A <0|1>     active low (1) or active high (0)
+     C S <ms>      stagger between the two motors, 0 disables
 
    Replies:
 
-     ok a b c d    the states actually applied right now
-     info ...      configuration
+     ok a b c d up=<ms>      the states actually applied right now
+     info ... up=<ms>        configuration
      err <reason>
+
+   And two lines that arrive WITHOUT being asked for. They start
+   with their own words so the Pi can tell them from a reply:
+
+     boot reason=<why>       printed once, when this chip starts
+     evt watchdog-released   printed when the watchdog drops the relays
+
+   'boot' appearing mid-session means the bridge restarted under
+   you. reason=BROWNOUT means the supply sagged, which on this
+   hardware means the motors took the rail down. So does up=
+   suddenly counting from near zero again.
 
    The reply to R reports what is APPLIED, which during a
    dead-time pause is not yet what you asked for. Send P a moment
    later to see it land.
 
    -------------------------------------------------------------
-   THE TWO THINGS FIRMWARE STILL DOES
+   THE THREE THINGS FIRMWARE STILL DOES
 
    Dead-time delays a reversal, it never changes one. Asking a
    spinning motor to reverse still reverses it, just up to
@@ -54,22 +75,32 @@
 
    The watchdog acts only when there is NO command. If the USB
    drops or the Pi dies, there is nothing to obey and the relays
-   release.
+   release. It cannot help if this chip is the thing that failed —
+   see the pull-up note above.
 
-   Both are off switches away:  C D 0  and  C W 0.
+   Stagger starts the two motors a few milliseconds apart. Both
+   starting together draws double the inrush, and inrush is what
+   sags a shared rail. Off by default; turn it on with C S 15 if
+   boot reason ever comes back BROWNOUT.
+
+   All three are off switches away:  C D 0, C W 0, C S 0.
    With the watchdog off, a crashed Pi leaves the motors running.
    Keep a physical kill switch on the motor battery.
    ============================================================= */
 
 #include <Arduino.h>
+#include <esp_system.h>
 
 const int PIN_IN[4] = {27, 26, 25, 33};   // IN1, IN2, IN3, IN4
 
 bool activeLow = true;                    // most 4-relay boards
 unsigned long deadtimeMs = 300;
 unsigned long watchdogMs = 400;
+unsigned long staggerMs = 0;
 
 unsigned long lastRx = 0;
+bool watchdogTripped = false;
+esp_reset_reason_t bootReason;
 
 // Relays pair up per motor: (IN1,IN2) and (IN3,IN4). This is the
 // only topology the firmware knows, and it exists so dead-time
@@ -135,24 +166,44 @@ void targetsOff() {
 
 // ---------------------------- replies ----------------------------
 
+const char *resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_EXT:       return "external-pin";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "PANIC";
+    case ESP_RST_INT_WDT:   return "INT-WATCHDOG";
+    case ESP_RST_TASK_WDT:  return "TASK-WATCHDOG";
+    case ESP_RST_WDT:       return "WATCHDOG";
+    case ESP_RST_DEEPSLEEP: return "deep-sleep-wake";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    case ESP_RST_SDIO:      return "sdio";
+    default:                return "unknown";
+  }
+}
+
 void replyOk() {
   bool s[4];
   s[pairs[0].ia] = pairs[0].apA;
   s[pairs[0].ib] = pairs[0].apB;
   s[pairs[1].ia] = pairs[1].apA;
   s[pairs[1].ib] = pairs[1].apB;
-  Serial.printf("ok %d %d %d %d\n", s[0], s[1], s[2], s[3]);
+  Serial.printf("ok %d %d %d %d up=%lu\n", s[0], s[1], s[2], s[3], millis());
 }
 
 void replyInfo() {
-  Serial.printf("info bridge=1 deadtime=%lu watchdog=%lu activelow=%d\n",
-                deadtimeMs, watchdogMs, activeLow ? 1 : 0);
+  Serial.printf(
+    "info bridge=1 deadtime=%lu watchdog=%lu activelow=%d stagger=%lu "
+    "boot=%s up=%lu\n",
+    deadtimeMs, watchdogMs, activeLow ? 1 : 0, staggerMs,
+    resetReasonName(bootReason), millis());
 }
 
 // ---------------------------- parsing ----------------------------
 
 void handleLine(char *line) {
   lastRx = millis();
+  watchdogTripped = false;
 
   switch (line[0]) {
     case 'R': case 'r': {
@@ -165,9 +216,22 @@ void handleLine(char *line) {
         Serial.println("err not-binary");
         return;
       }
+
+      // Does each motor actually change? Asked before the targets
+      // move, because that is what decides whether staggering them
+      // buys anything.
+      bool moves0 = (pairs[0].apA != (bool)a) || (pairs[0].apB != (bool)b);
+      bool moves1 = (pairs[1].apA != (bool)c) || (pairs[1].apB != (bool)d);
+
       pairs[0].tgA = a; pairs[0].tgB = b;
       pairs[1].tgA = c; pairs[1].tgB = d;
-      tick(pairs[0]);                     // apply now if no flip pending
+
+      if (staggerMs > 0 && moves0 && moves1) {
+        unsigned long due = millis() + staggerMs;
+        if (pairs[1].holdUntil < due) pairs[1].holdUntil = due;
+      }
+
+      tick(pairs[0]);                     // apply now if nothing pending
       tick(pairs[1]);
       replyOk();
       return;
@@ -199,6 +263,7 @@ void handleLine(char *line) {
       switch (toupper(which)) {
         case 'D': deadtimeMs = val; break;
         case 'W': watchdogMs = val; break;
+        case 'S': staggerMs  = val; break;
         case 'A': activeLow = (val != 0); pushAll(); break;
         default:  Serial.println("err bad-key"); return;
       }
@@ -235,17 +300,25 @@ void readSerial() {
 // ----------------------------- main -----------------------------
 
 void setup() {
-  Serial.begin(115200);
-
+  // Pins first, ahead of everything including Serial. Every
+  // millisecond spent before this line is a millisecond the relays
+  // are answering to a floating input rather than to us.
+  //
+  // Latch the level BEFORE switching the pin to an output: a fresh
+  // output starts low, and low is exactly what an active-low board
+  // reads as "on". Writing first means it comes up already released.
   for (int i = 0; i < 4; i++) {
+    coil(i, false);
     pinMode(PIN_IN[i], OUTPUT);
     coil(i, false);
   }
 
+  bootReason = esp_reset_reason();
+
+  Serial.begin(115200);
   delay(200);
   Serial.println();
-  Serial.println("info relay bridge ready");
-  replyInfo();
+  Serial.printf("boot reason=%s\n", resetReasonName(bootReason));
 
   lastRx = millis();
 }
@@ -254,7 +327,15 @@ void loop() {
   readSerial();
 
   // Nothing heard for too long means there is no command to obey.
-  if (watchdogMs > 0 && millis() - lastRx > watchdogMs) targetsOff();
+  // Say so once, rather than every pass — silence here has been
+  // mistaken for the watchdog working before now.
+  if (watchdogMs > 0 && millis() - lastRx > watchdogMs) {
+    if (!watchdogTripped) {
+      watchdogTripped = true;
+      Serial.println("evt watchdog-released");
+    }
+    targetsOff();
+  }
 
   tick(pairs[0]);
   tick(pairs[1]);

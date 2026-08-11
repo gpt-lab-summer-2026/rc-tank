@@ -39,6 +39,51 @@ one thing that already worked.
 
 ---
 
+## Phase 0.5 — The runaway ⛔ OPEN
+
+**Goal:** find out why the tank sometimes keeps driving with nothing
+in control, and stop it happening. **Nothing else proceeds until this
+is closed** — every later phase assumes the watchdog works.
+
+**What is known.** No relay clicks when the script is killed, so the
+ESP32 was not running its watchdog. The failure is on the ESP32 or
+below it, not on the Pi. Prime suspect is a brownout latch-up: motor
+current sags the rail → ESP32 resets → its pins float → an active-low
+board reads floating as "on" → motors keep running → rail stays
+sagged → it never finishes booting. Only removing the motor load
+breaks the loop, which is what you found.
+
+### Do — confirm it
+- [ ] Reflash the ESP32 with the updated firmware
+- [ ] Run `python3 teleop.py` and read the line after the config dump
+- [ ] Note the `boot=` value: **`BROWNOUT` confirms the diagnosis outright**
+- [ ] Drive normally and watch for `*** BRIDGE RESTARTED ***` in the terminal
+- [ ] On quitting, note the restart count in the exit summary
+- [ ] Reproduce the runaway, then check what the boot reason says next start
+
+### Do — fix it
+- [ ] ⛔ **10 kΩ pull-up from each of IN1–IN4 to 3V3.** Four resistors.
+      This is the only thing that holds the relays off while the ESP32
+      is not running, and no firmware change can substitute for it.
+- [ ] Stop powering the relay coils from the ESP32's 5 V — give them
+      their own supply from the motor pack, grounds tied together
+- [ ] Bulk capacitance (470–1000 µF) on the ESP32's 5 V, plus 0.1 µF at the pin header
+- [ ] RC snubber (0.1 µF + 100 Ω) across each motor's terminals
+- [ ] 0.1 µF ceramic directly across each motor's brushes
+- [ ] Motor leads short, twisted, routed away from the ESP32 and camera ribbon
+- [ ] If brownouts persist under load, enable motor stagger: `C S 15`
+
+### Gate
+- [ ] ⛔ 20 minutes of hard driving — reversals, stalls, spins on carpet —
+      with **zero** `BRIDGE RESTARTED` messages
+- [ ] ⛔ Killing the script mid-drive produces four audible clicks and a stop
+- [ ] ⛔ Boot reason reads `power-on` or `external-pin` on every start,
+      never `BROWNOUT` or `PANIC`
+- [ ] Deliberately stalling both tracks against a wall does not reset the bridge
+- [ ] The kill switch is fitted, on the **motor battery**, and reachable
+
+---
+
 ## Phase 1 — Camera and recording
 
 **Goal:** frames on disk, correct and complete. This is the only sensor

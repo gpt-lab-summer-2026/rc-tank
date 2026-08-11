@@ -17,13 +17,13 @@ and the car keeps doing that until you press another one or space.
 from __future__ import annotations
 
 import argparse
+import os
 import select
 import sys
 import termios
-import time
 import tty
 
-from car import Car, BridgeError
+from car import Car, BridgeError, boot_warning
 
 # key -> (label, (left, right))
 KEYS = {
@@ -48,9 +48,25 @@ Commands latch until you press another key.
 """
 
 
-def read_key(timeout: float = 0.1) -> str | None:
+def read_keys(timeout: float = 0.1) -> str:
+    """Every key pressed since the last call, in order.
+
+    Reads the file descriptor rather than sys.stdin, because the two
+    do not agree with select(). sys.stdin.read(1) pulls the whole
+    pending chunk out of the OS and hands back one character, leaving
+    the rest in a buffer select() cannot see — so the next select()
+    reports nothing waiting and those keys sit unnoticed until
+    another one arrives.
+
+    It bites hardest exactly when it matters: if the bridge is slow,
+    every command blocks for the read timeout, keystrokes pile up
+    behind it, and the one that goes missing is the stop you just
+    pressed twice.
+    """
     ready, _, _ = select.select([sys.stdin], [], [], timeout)
-    return sys.stdin.read(1) if ready else None
+    if not ready:
+        return ""
+    return os.read(sys.stdin.fileno(), 64).decode(errors="replace")
 
 
 def main() -> int:
@@ -66,45 +82,52 @@ def main() -> int:
 
     print(f"connected on {car.port}")
     print(car.info())
+
+    warning = boot_warning(car.boot_reason)
+    if warning:
+        print(f"\n  !! {warning}\n")
+
     print(HELP)
 
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
-    label = "stop"
+    quitting = False
 
     try:
         tty.setcbreak(fd)
-        while True:
-            key = read_key()
-            if key is None:
-                continue
+        while not quitting:
+            for key in read_keys().lower():
+                if key == "x":
+                    quitting = True
+                    break
+                if key == "i":
+                    print("\r" + car.info())
+                    continue
+                if key not in KEYS:
+                    continue
 
-            key = key.lower()
-            if key == "x":
-                break
-            if key == "i":
-                print("\r" + car.info())
-                continue
-            if key not in KEYS:
-                continue
+                label, (left, right) = KEYS[key]
+                try:
+                    car.drive(left, right)
+                except BridgeError as e:
+                    print(f"\rerror: {e}")
+                    continue
 
-            label, (left, right) = KEYS[key]
-            try:
-                car.drive(left, right)
-            except BridgeError as e:
-                print(f"\rerror: {e}")
-                continue
-
-            # \r and padding keep the status on one line in cbreak mode
-            print(f"\r{label:<12} left={left:+d} right={right:+d}   ", end="")
-            sys.stdout.flush()
+                # \r and padding keep the status on one line in cbreak mode
+                print(f"\r{label:<12} left={left:+d} right={right:+d}   ", end="")
+                sys.stdout.flush()
 
     except KeyboardInterrupt:
         pass
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        resets = car.resets
         car.close()
         print("\nstopped, port closed")
+        if resets:
+            print(f"\n!! the bridge restarted {resets} time(s) during that session.")
+            print("   Each restart is a window where the relays answered to")
+            print("   nothing. Check the boot reason above and the 5V supply.")
 
     return 0
 
