@@ -45,42 +45,130 @@ one thing that already worked.
 in control, and stop it happening. **Nothing else proceeds until this
 is closed** — every later phase assumes the watchdog works.
 
-**What is known.** No relay clicks when the script is killed, so the
-ESP32 was not running its watchdog. The failure is on the ESP32 or
-below it, not on the Pi. Prime suspect is a brownout latch-up: motor
-current sags the rail → ESP32 resets → its pins float → an active-low
-board reads floating as "on" → motors keep running → rail stays
-sagged → it never finishes booting. Only removing the motor load
-breaks the loop, which is what you found.
+**What the instrumented run showed.** `evt watchdog-released` printed,
+and the boot reason read `power-on` every time. That is close to
+conclusive:
 
-### Do — confirm it
-- [ ] Reflash the ESP32 with the updated firmware
-- [ ] Run `python3 teleop.py` and read the line after the config dump
-- [ ] Note the `boot=` value: **`BROWNOUT` confirms the diagnosis outright**
-- [ ] Drive normally and watch for `*** BRIDGE RESTARTED ***` in the terminal
-- [ ] On quitting, note the restart count in the exit summary
-- [ ] Reproduce the runaway, then check what the boot reason says next start
+- The event line means the ESP32 **was running** — it timed out, said
+  so, and called `targetsOff()`. Firmware did its job.
+- `power-on` every start and nothing else means **no brownouts, no
+  crashes, no unexpected resets**. Opening the serial port resets the
+  board over DTR, so `power-on` is the expected reading.
 
-### Do — fix it
-- [ ] ⛔ **10 kΩ pull-up from each of IN1–IN4 to 3V3.** Four resistors.
-      This is the only thing that holds the relays off while the ESP32
-      is not running, and no firmware change can substitute for it.
-- [ ] Stop powering the relay coils from the ESP32's 5 V — give them
-      their own supply from the motor pack, grounds tied together
-- [ ] Bulk capacitance (470–1000 µF) on the ESP32's 5 V, plus 0.1 µF at the pin header
-- [ ] RC snubber (0.1 µF + 100 Ω) across each motor's terminals
-- [ ] 0.1 µF ceramic directly across each motor's brushes
-- [ ] Motor leads short, twisted, routed away from the ESP32 and camera ribbon
-- [ ] If brownouts persist under load, enable motor stagger: `C S 15`
+So the ESP32 commanded the relays off and the motors kept turning.
+**The fault is downstream of the ESP32 — in the relays or the
+wiring.** Power supply and firmware are both ruled out.
+
+This also explains the silence. Driving forward energises one relay
+per motor; if that relay's contacts weld, the armature is held by the
+weld and cannot move, and the other relay was never energised. Zero
+clicks is what a weld sounds like.
+
+**Why contacts weld here.** In this topology there is no state where
+the motor is disconnected — both-off ties the terminals together, and
+so does both-on. Every change therefore breaks motor current at some
+contact, and DC arcs do not self-extinguish the way AC ones do at a
+zero crossing. Relay DC ratings assume resistive loads; against a
+motor the real capability is far lower. These contacts were always
+going to erode. The open question is only how fast.
+
+### Confirmed so far
+- [x] `relays[0 0 0 0]` displayed while the tracks were still turning
+- [x] Relays stick most often **after an arc command**
+- [x] A short burst of **reverse frees them**, and driving resumes normally
+- [x] Commands arriving faster than the contacts settle leave the state
+      chasing itself
+
+**Mitigations now in software** — a workaround, not a cure. The
+contacts still stick; these make it recoverable without touching the
+hardware.
+
+- 2 s cooldown between direction changes (`--cooldown`). Presses
+  inside the window show `HELD` and change nothing. Held commands
+  still resend the *current* state, so the watchdog never mistakes a
+  rate-limited operator for a dead one.
+- `r` in teleop runs the reverse-then-stop jolt. Stop and unstick are
+  never rate limited.
+- Per-relay `ops=` counters, so contact wear is tracked.
+
+The cooldown costs reaction time, which matters from Phase 2 onward:
+2 s at 0.4 m/s is 80 cm of committed travel, further than the camera
+can see ahead. Perception cannot compensate — see the `--cooldown`
+entry in `roam.py`'s TUNING block.
+
+Firmware and power are both exonerated. With every relay
+de-energised, all four motor terminals should sit at battery
+negative — same potential both ends, no current, motors braked. They
+ran anyway, so either a contact is not opening, or the wiring differs
+from the diagram.
+
+### Do — separate those two, no multimeter needed
+- [ ] ⛔ **Unplug the ESP32 (USB) with the motor battery connected.**
+      Every relay is now at rest whatever the firmware thinks.
+      - **Motors run** → the *rest state* drives them. Wiring fault:
+        a swapped NO/NC, a loose lead, or a short bypassing a contact.
+        No contact is stuck at all.
+      - **Motors stay still** → rest wiring is correct, so during the
+        runaway something held a contact closed. Weld or latched driver.
+- [ ] Swap the two motors between relay pairs and reproduce. Fault
+      follows the **motor** → wiring or a short on that motor's leads.
+      Fault stays with the **relay pair** → that pair is at fault.
+
+### Do — with the motor battery disconnected
+- [ ] `python3 teleop.py --selftest` — energises each relay alone.
+      Listen for eight clicks: four on, four off. A silent one is stuck
+- [ ] Meter **COM to NO** on each relay, de-energised. It must read
+      open. Continuity means that contact is welded
+- [ ] Meter **COM to NC** on each relay, de-energised. It must read
+      closed, and NC must go to battery **negative** on all four —
+      one swapped pair is enough to drive a motor at rest
+- [ ] Tug every motor and battery lead. Intermittent faults on a
+      vibrating tracked chassis are usually a wire, not a component
+- [ ] Note the `ops=` counts from the selftest and log them each session
+
+### Do — reduce the damage rate
+Contacts cannot be un-welded, and no firmware change avoids breaking
+motor current — this topology has no disconnected state. These slow
+the erosion down:
+- [ ] ⛔ **RC snubber (0.1 µF + 100 Ω) across each relay's switched
+      contacts.** This is the one that matters. It absorbs the arc
+      energy at break, which is what does the welding.
+- [ ] 0.1 µF ceramic across each motor's brushes
+- [ ] Replace any relay that has already welded once — a repaired weld
+      leaves a pitted contact that welds again sooner
+- [ ] Raise `--min-interval` and `--turn-margin` to cut direction
+      changes per minute; every change is one break under load
+- [ ] Avoid switching while the tracks are stalled — stall current is
+      several times running current, and welds form fastest there
+
+### Do — make the failure survivable
+Since it will recur, the tank has to be safe when it does:
+- [ ] ⛔ **Kill switch on the motor battery**, reachable without
+      chasing the tank. This is now required equipment, not a Phase 3
+      nicety — it is the only control that still works
+- [ ] ⛔ **10 kΩ pull-up from each of IN1–IN4 to 3V3**, still worth
+      fitting: it covers a reset or hang, a different failure this
+      evidence did not rule out
+- [ ] Keep the relay coils on the ESP32's 5 V so losing that rail
+      releases them
+- [ ] Test on a stand with the tracks off the ground until this closes
 
 ### Gate
-- [ ] ⛔ 20 minutes of hard driving — reversals, stalls, spins on carpet —
-      with **zero** `BRIDGE RESTARTED` messages
-- [ ] ⛔ Killing the script mid-drive produces four audible clicks and a stop
-- [ ] ⛔ Boot reason reads `power-on` or `external-pin` on every start,
-      never `BROWNOUT` or `PANIC`
-- [ ] Deliberately stalling both tracks against a wall does not reset the bridge
-- [ ] The kill switch is fitted, on the **motor battery**, and reachable
+- [ ] ⛔ Which failure it is has been established by measurement, not guessed
+- [ ] ⛔ Killing the script mid-drive stops the tracks, 10 times out of 10
+- [ ] ⛔ Pressing space stops the tracks, 10 times out of 10
+- [ ] ⛔ Kill switch on the motor battery, fitted and reachable
+- [ ] Snubbers fitted across the relay contacts
+- [ ] 20 minutes of hard driving — reversals, stalls, spins on carpet —
+      with no runaway
+- [ ] `ops=` counts are being logged per session, so contact wear is
+      tracked rather than discovered
+
+> **If welding recurs after snubbing**, relays are the wrong part for
+> this job and no amount of derating fixes it — a MOSFET H-bridge has
+> no contacts to weld. That was declined earlier on scope grounds,
+> which was reasonable then; this is new evidence, and it is worth
+> reconsidering rather than treating as settled.
 
 ---
 

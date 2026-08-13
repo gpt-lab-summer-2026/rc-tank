@@ -7,6 +7,7 @@ watchdog all work before any camera or model is involved.
 
     python3 teleop.py
     python3 teleop.py --port /dev/ttyUSB0
+    python3 teleop.py --selftest        click each relay (motors off!)
 
 Keep car.py in the same directory.
 
@@ -21,6 +22,7 @@ import os
 import select
 import sys
 import termios
+import time
 import tty
 
 from car import Car, BridgeError, boot_warning
@@ -42,9 +44,21 @@ HELP = """
   q  arc left       e  arc right
 
   space  stop       x  quit
-  i      show firmware config
+  r      unstick    i  show config and relay operation counts
 
 Commands latch until you press another key.
+
+Direction changes are rate limited (--cooldown). A press inside that
+window shows HELD and does nothing — the contacts need the time, and
+spamming keys only leaves the state chasing itself. Space is never
+held.
+
+r drives backwards briefly, then stops. That clears a relay that has
+stayed engaged, usually after an arc. Expect the rover to move.
+
+relays[...] is what the bridge reports as APPLIED. Pressing space
+should show relays[0 0 0 0]. If it does and the tracks keep turning,
+try r. If that does not free it either, cut the motor power.
 """
 
 
@@ -69,13 +83,82 @@ def read_keys(timeout: float = 0.1) -> str:
     return os.read(sys.stdin.fileno(), 64).decode(errors="replace")
 
 
+def relay_ops(info_line: str) -> list[int]:
+    """Per-relay actuation counts out of an info reply."""
+    for field in info_line.split():
+        if field.startswith("ops="):
+            try:
+                return [int(x) for x in field[4:].split(",")]
+            except ValueError:
+                break
+    return []
+
+
+def selftest(car: Car) -> int:
+    """Click each relay on its own, with a human as the sensor.
+
+    Nothing reports back from the contacts, so the firmware cannot
+    tell a relay that opened from one that welded shut. It can only
+    energise them one at a time and leave you to listen. Four relays,
+    four clicks, four releases. A relay that stays silent is stuck,
+    and a stuck relay is what keeps a tank driving after it has been
+    told to stop.
+    """
+    print("\n  DISCONNECT THE MOTOR BATTERY FIRST.")
+    print("  This energises relays on purpose. With motors attached,")
+    print("  the tank will move.\n")
+    try:
+        input("  Motors disconnected? Enter to run, ctrl-c to abort. ")
+    except (KeyboardInterrupt, EOFError):
+        print("\n  aborted")
+        return 1
+
+    before = relay_ops(car.info())
+    print()
+
+    for i in range(4):
+        state = [0, 0, 0, 0]
+        state[i] = 1
+        print(f"  relay {i + 1} (IN{i + 1})   energise ...", end="", flush=True)
+        car.relays(*state)
+        time.sleep(0.6)
+        print(" release ...", end="", flush=True)
+        car.relays(0, 0, 0, 0)
+        time.sleep(0.5)
+        print(" done")
+
+    after = relay_ops(car.info())
+    print()
+    if before and after and len(before) == len(after) == 4:
+        print("  lifetime operations, per relay:")
+        for i, (b, a) in enumerate(zip(before, after)):
+            print(f"    IN{i + 1}  {a:6d}   (+{a - b} this test)")
+        print()
+        print("  Contacts are a consumable. Log these each session — welding")
+        print("  gets likelier as they climb, and nothing warns you first.")
+        print()
+
+    print("  You should have heard EIGHT clicks: four energise, four release.")
+    print("  A relay that never clicked, or clicked once and not again, is")
+    print("  stuck. With the motor battery still disconnected, meter COM to")
+    print("  NO on that relay — it must read open. Continuity means welded.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", default=None, help="serial device")
+    ap.add_argument("--selftest", action="store_true",
+                    help="click each relay in turn, then stop (motors off!)")
+    ap.add_argument("--cooldown", type=float, default=2.0,
+                    help="seconds between direction changes; presses inside "
+                         "this window are held (0 disables)")
+    ap.add_argument("--unstick-time", type=float, default=0.5,
+                    help="seconds to drive backwards when r is pressed")
     args = ap.parse_args()
 
     try:
-        car = Car(port=args.port)
+        car = Car(port=args.port, command_cooldown=args.cooldown)
     except BridgeError as e:
         print(f"could not open the bridge: {e}", file=sys.stderr)
         return 1
@@ -86,6 +169,12 @@ def main() -> int:
     warning = boot_warning(car.boot_reason)
     if warning:
         print(f"\n  !! {warning}\n")
+
+    if args.selftest:
+        try:
+            return selftest(car)
+        finally:
+            car.close()
 
     print(HELP)
 
@@ -103,18 +192,40 @@ def main() -> int:
                 if key == "i":
                     print("\r" + car.info())
                     continue
+                if key == "r":
+                    print("\runsticking — reversing briefly ...", end="")
+                    sys.stdout.flush()
+                    try:
+                        car.unstick(args.unstick_time)
+                        print(" done, stopped        ")
+                    except BridgeError as e:
+                        print(f"\rerror: {e}")
+                    continue
                 if key not in KEYS:
                     continue
 
                 label, (left, right) = KEYS[key]
                 try:
-                    car.drive(left, right)
+                    reply = car.drive(left, right)
                 except BridgeError as e:
                     print(f"\rerror: {e}")
                     continue
 
+                # Show what the bridge says is APPLIED, not what was
+                # asked for. If this reads 0 0 0 0 while the tracks are
+                # still turning, the firmware did as it was told and the
+                # fault is a contact that will not open.
+                applied = " ".join(reply.split()[1:5])
+
+                if car.last_command_held:
+                    # Say why nothing happened. A key that appears to do
+                    # nothing is indistinguishable from a broken one.
+                    status = f"HELD {car.cooldown_remaining():.1f}s   "
+                else:
+                    status = f"{label:<12} left={left:+d} right={right:+d}"
+
                 # \r and padding keep the status on one line in cbreak mode
-                print(f"\r{label:<12} left={left:+d} right={right:+d}   ", end="")
+                print(f"\r{status}  relays[{applied}]      ", end="")
                 sys.stdout.flush()
 
     except KeyboardInterrupt:
