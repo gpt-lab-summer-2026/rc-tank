@@ -95,8 +95,30 @@ def mix(steer: float, throttle: float, dz: float) -> tuple[int, int]:
 # ----------------------------------------------------------- camera
 
 
+# The camera on this rover is mounted upside down, so every frame
+# needs turning 180 degrees before anything looks at it. Set to 0 if
+# you ever remount it the right way up.
+#
+# This is not cosmetic. roam.py learns its floor model from a patch
+# at the BOTTOM of the frame and measures free space upwards from the
+# bottom row, both of which assume the bottom of the array is the
+# ground nearest the car. Feed it an inverted frame and it learns
+# whatever is above the horizon — ceiling, far wall, sky — and calls
+# that floor. Nothing downstream can detect this or recover from it.
+CAMERA_ROTATION = 180
+
+
 class Camera:
-    def __init__(self, size=(640, 480), fps=30, lock_exposure=False):
+    """Frames from the Pi camera, the right way up.
+
+    rotate is applied before any caller sees a frame, so orientation
+    is settled in exactly one place. Prefer the ISP to do it — it is
+    free there — but fall back to rotating in software rather than
+    silently handing back an upside-down frame.
+    """
+
+    def __init__(self, size=(640, 480), fps=30, lock_exposure=False,
+                 rotate=CAMERA_ROTATION):
         try:
             from picamera2 import Picamera2
         except ImportError:
@@ -106,6 +128,14 @@ class Camera:
                 "In a venv, create it with --system-site-packages."
             )
 
+        if rotate not in (0, 180):
+            raise ValueError(
+                f"rotate must be 0 or 180, got {rotate}. Ninety degrees "
+                "would transpose the frame and is not supported."
+            )
+        self.rotate = rotate
+        self._rotate_in_software = False
+
         self.cam = Picamera2()
 
         cfg = {
@@ -114,6 +144,17 @@ class Camera:
             "main": {"size": size, "format": "RGB888"},
             "controls": {"FrameRate": fps},
         }
+
+        # A 180 degree turn is a horizontal flip and a vertical flip,
+        # which the ISP can do while the frame is already in its hands.
+        # Older picamera2 builds have no Transform to give it, so this
+        # is allowed to fail and hand the job to frame().
+        if rotate == 180:
+            try:
+                from libcamera import Transform
+                cfg["transform"] = Transform(hflip=1, vflip=1)
+            except (ImportError, TypeError):
+                self._rotate_in_software = True
 
         # Several sensor modes are cropped rather than binned — on the
         # IMX219 (camera v2) the 1080p and 640x480 modes read only part
@@ -125,7 +166,27 @@ class Camera:
             cfg["raw"] = {"size": mode}
             print(f"sensor mode {mode[0]}x{mode[1]} (full field of view)")
 
-        self.cam.configure(self.cam.create_video_configuration(**cfg))
+        # Not every sensor and pipeline combination accepts a transform.
+        # One that refuses must not take the whole run down, and must
+        # not quietly drop the rotation either — retry without it and
+        # rotate each frame ourselves instead.
+        try:
+            self.cam.configure(self.cam.create_video_configuration(**cfg))
+        except Exception:
+            if "transform" not in cfg:
+                raise
+            cfg.pop("transform")
+            self._rotate_in_software = True
+            self.cam.configure(self.cam.create_video_configuration(**cfg))
+
+        if self._rotate_in_software:
+            import cv2                      # deferred, as it is elsewhere here
+            self._cv2 = cv2
+
+        if self.rotate:
+            where = "in software" if self._rotate_in_software else "by the ISP"
+            print(f"rotating frames {self.rotate} degrees ({where})")
+
         self.cam.start()
         time.sleep(2.0)                     # let AE and AWB settle
 
@@ -163,7 +224,10 @@ class Camera:
             return None
 
     def frame(self):
-        return self.cam.capture_array()
+        img = self.cam.capture_array()
+        if self._rotate_in_software:
+            img = self._cv2.rotate(img, self._cv2.ROTATE_180)
+        return img
 
     def close(self):
         self.cam.stop()
@@ -368,6 +432,9 @@ def main() -> int:
                          "(needs evdev; not used by default)")
     ap.add_argument("--no-car", action="store_true", help="do not drive, camera only")
     ap.add_argument("--lock-exposure", action="store_true", help="fix AE/AWB after warmup")
+    ap.add_argument("--rotate", type=int, default=CAMERA_ROTATION, choices=(0, 180),
+                    help="turn each frame before it is saved "
+                         f"(default {CAMERA_ROTATION}, this camera is mounted upside down)")
     ap.add_argument(
         "--idle-skip",
         type=float,
@@ -403,7 +470,7 @@ def main() -> int:
     # Camera bails with SystemExit when picamera2 is missing. Landing
     # in the shell with cbreak still set leaves it unusable.
     try:
-        cam = Camera(lock_exposure=args.lock_exposure)
+        cam = Camera(lock_exposure=args.lock_exposure, rotate=args.rotate)
     except BaseException:
         source.close()
         if car is not None:
@@ -422,6 +489,10 @@ def main() -> int:
                 "save_size": [args.width, args.height],
                 "jpeg_quality": args.quality,
                 "lock_exposure": args.lock_exposure,
+                # Which way up the saved frames are. A dataset recorded
+                # before this was settled is not comparable with one
+                # recorded after, and nothing in the JPEGs says so.
+                "rotate": args.rotate,
                 "idle_skip_s": args.idle_skip,
             },
             fh,

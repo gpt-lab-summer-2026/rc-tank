@@ -57,7 +57,7 @@ const int PIN_TRIG = 13;
 
 // True if driving an optocoupler LED directly. Set false for relay
 // or opto boards with active-low inputs.
-const bool ACTIVE_HIGH = true;
+const bool ACTIVE_HIGH = false;
 
 // Stick travel (%) before a direction asserts. The controls are
 // on/off, so this is just how far you push before it fires.

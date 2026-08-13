@@ -37,7 +37,7 @@
    BEFORE YOU CUT ANYTHING
 
    Reconnect the pot temporarily, power the remote, and meter the
-   wiper (middle pin) against yellow while moving the stick. You
+   wiper (middle pin) against yellow while moving the stick. You  
    should see a smooth sweep. Write down three numbers:
 
      full one way ... V     -> V_FULL_REV

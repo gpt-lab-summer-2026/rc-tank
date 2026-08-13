@@ -69,9 +69,21 @@
    THE THREE THINGS FIRMWARE STILL DOES
 
    Dead-time delays a reversal, it never changes one. Asking a
-   spinning motor to reverse still reverses it, just up to
-   DEADTIME_MS later with a stop inserted. The ESP32 does this
-   because it knows when the contact settled and the Pi does not.
+   spinning motor to reverse still reverses it, just deadtime= ms
+   later with a stop inserted. The ESP32 does this because it knows
+   when the contact settled and the Pi does not.
+
+   It delays NOTHING ELSE. A reversal is the only order that waits:
+   a stop, a start, or going back to the direction the motor was
+   already turning is applied the moment the line lands, including
+   part-way through a pause that some earlier order started. An
+   order that arrives mid-pause and is still a reversal keeps
+   waiting out the original delay rather than restarting it, so
+   hammering the keys cannot stretch a pause indefinitely.
+
+   The practical shape of that, per motor: pause only when the
+   contacts are making one way and the new order makes them the
+   other way. Once both coils are open, nothing is queued.
 
    The watchdog acts only when there is NO command. If the USB
    drops or the Pi dies, there is nothing to obey and the relays
@@ -105,16 +117,24 @@ esp_reset_reason_t bootReason;
 // Relays pair up per motor: (IN1,IN2) and (IN3,IN4). This is the
 // only topology the firmware knows, and it exists so dead-time
 // can tell a reversal from any other state change.
+//
+// The two delays are kept apart on purpose. They are unrelated —
+// one protects the motor, the other protects the supply rail — and
+// sharing a single timer between them is what used to make an
+// unrelated command wait out a reversal it had nothing to do with.
 struct Pair {
   int ia, ib;                 // indices into PIN_IN
   bool apA, apB;              // applied
   bool tgA, tgB;              // target
-  unsigned long holdUntil;
+  unsigned long deadUntil;    // reversal pause expiry
+  bool inDead;                // a reversal pause is running
+  bool deadFrom;              // apA as it was when that pause began
+  unsigned long staggerUntil; // inrush delay expiry
 };
 
 Pair pairs[2] = {
-  {0, 1, false, false, false, false, 0},
-  {2, 3, false, false, false, false, 0},
+  {0, 1, false, false, false, false, 0, false, false, 0},
+  {2, 3, false, false, false, false, 0, false, false, 0},
 };
 
 // ---------------------------- relays ----------------------------
@@ -134,26 +154,55 @@ void pushAll() {
 }
 
 // Walks applied towards target. A direction flip goes through
-// both-off first and waits out the dead-time.
+// both-off first and waits out the dead-time. Everything else is
+// applied the moment it arrives.
 void tick(Pair &p) {
-  if (p.tgA == p.apA && p.tgB == p.apB) return;
+  if (p.tgA == p.apA && p.tgB == p.apB) {
+    // Nothing outstanding. If a reversal pause was running, the move
+    // it was holding back has since been withdrawn — a stop, usually
+    // — so drop the pause rather than leave it timing out against an
+    // order nobody is waiting for any more.
+    p.inDead = false;
+    return;
+  }
 
   unsigned long now = millis();
-  if (now < p.holdUntil) return;
+  bool driving   = p.apA != p.apB;     // contacts are making, one way
+  bool wantDrive = p.tgA != p.tgB;     // asked to keep making, either way
 
-  bool flipping = deadtimeMs > 0 &&
-                  (p.apA != p.apB) &&      // currently driving
-                  (p.tgA != p.tgB) &&      // asked to keep driving
-                  (p.apA != p.tgA);        // the other way
+  // Stagger spreads inrush, so it only has anything to say about
+  // orders that draw current. A stop is let straight through.
+  if (wantDrive && now < p.staggerUntil) return;
 
-  if (flipping) {
+  // The one change worth delaying: both coils open, then the other
+  // way round once the armature has had a moment to stop pushing
+  // back against it.
+  if (deadtimeMs > 0 && driving && wantDrive && p.apA != p.tgA) {
+    p.deadFrom = p.apA;
+    p.inDead = true;
+    p.deadUntil = now + deadtimeMs;
     p.apA = false;
     p.apB = false;
-    p.holdUntil = now + deadtimeMs;
-  } else {
-    p.apA = p.tgA;
-    p.apB = p.tgB;
+    push(p);
+    return;
   }
+
+  // Mid-pause. Keep waiting only while the standing order still
+  // points the other way. Asking for the direction it was already
+  // turning, or for a stop, is not a reversal and must not sit out
+  // the rest of a delay that was protecting against a different move
+  // entirely — waiting there is what made the controls feel
+  // rate-limited, and it protected nothing, because the motor is
+  // already stopped and the request is not a reversal.
+  // deadtimeMs is re-read here rather than trusted from pause entry,
+  // so C D 0 releases a pause already running instead of leaving one
+  // last delay to time out after the feature was switched off.
+  if (deadtimeMs > 0 && p.inDead && now < p.deadUntil &&
+      wantDrive && p.tgA != p.deadFrom) return;
+
+  p.inDead = false;
+  p.apA = p.tgA;
+  p.apB = p.tgB;
   push(p);
 }
 
@@ -228,7 +277,7 @@ void handleLine(char *line) {
 
       if (staggerMs > 0 && moves0 && moves1) {
         unsigned long due = millis() + staggerMs;
-        if (pairs[1].holdUntil < due) pairs[1].holdUntil = due;
+        if (pairs[1].staggerUntil < due) pairs[1].staggerUntil = due;
       }
 
       tick(pairs[0]);                     // apply now if nothing pending

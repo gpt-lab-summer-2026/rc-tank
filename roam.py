@@ -47,7 +47,7 @@ import cv2
 import numpy as np
 
 from car import BridgeError, Car, boot_warning
-from record import Camera, label_of
+from record import CAMERA_ROTATION, Camera, label_of
 
 # ------------------------------------------------------- floor model
 
@@ -254,6 +254,9 @@ def main() -> int:
                          "(default: five ticks, at least 0.5s)")
     ap.add_argument("--no-lock-exposure", action="store_true",
                     help="leave AE/AWB running (the floor model will drift)")
+    ap.add_argument("--rotate", type=int, default=CAMERA_ROTATION, choices=(0, 180),
+                    help="turn each frame before anything looks at it "
+                         f"(default {CAMERA_ROTATION}, this camera is mounted upside down)")
     ap.add_argument("--debug-image", default=None, help="write an annotated frame here")
     args = ap.parse_args()
 
@@ -261,7 +264,7 @@ def main() -> int:
     # auto-exposure and auto-white-balance running means the camera
     # keeps changing those colours underneath it, and the model rots
     # over minutes for no reason that appears in any log.
-    cam = Camera(lock_exposure=not args.no_lock_exposure)
+    cam = Camera(lock_exposure=not args.no_lock_exposure, rotate=args.rotate)
 
     # Tied to the tick rate rather than fixed: too short and a slow
     # frame drops the motors for no reason, too long and a loop that
