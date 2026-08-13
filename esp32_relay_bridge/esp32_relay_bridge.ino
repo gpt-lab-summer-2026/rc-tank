@@ -17,9 +17,36 @@
      ESP32 GND     -> module GND
      module VCC    -> 5V
 
+     ESP32 GPIO 32 -> buzzer +
+     ESP32 GND     -> buzzer -
+
      COM -> its own motor terminal
      NO  -> battery +    (all four)
      NC  -> battery -    (all four)
+
+   -------------------------------------------------------------
+   BUZZER — NOT ON GPIO 35
+
+   GPIO 34, 35, 36 and 39 on a classic ESP32 are input-only. They
+   have no output driver on the die at all, so pinMode(OUTPUT) is
+   ignored and the pin can neither source nor sink current. A buzzer
+   wired to one of them is silent no matter what this firmware does,
+   and nothing reports an error. GPIO 32 is used instead: free here,
+   not a strapping pin, and next to 33 on most dev boards.
+
+   It wants a PASSIVE buzzer — the kind with no oscillator inside.
+   Those take a square wave and play whatever pitch you feed them,
+   which is what makes three distinct notes possible. An ACTIVE
+   buzzer has its own oscillator and one fixed pitch, so the tune
+   below degenerates into three beeps of the same note. Still a
+   usable startup signal, just not a tune.
+
+   A piezo element can hang straight off the GPIO — it is basically
+   a capacitor and draws almost nothing. An electromagnetic buzzer
+   cannot: it will pull more than the 20 mA a pin should give, so
+   drive it through a small NPN transistor with a flyback diode, and
+   take the coil current from 5V rather than 3V3. That rail is
+   already the one that browns out under motor inrush.
 
    On this build motor 1 (IN1/IN2) is the RIGHT track and motor 2
    (IN3/IN4) is the LEFT. The firmware neither knows nor cares —
@@ -156,6 +183,19 @@ Pair pairs[2] = {
   {0, 1, false, false, false, false, 0, false, false, 0},
   {2, 3, false, false, false, false, 0, false, false, 0},
 };
+
+// One note of the startup tune. The buzzer code is all further down,
+// but this type has to be declared up here, above the first function
+// definition in the file.
+//
+// The Arduino IDE generates a prototype for every function and injects
+// them all immediately before the first function definition. That is
+// several hundred lines above the buzzer section, so a Note declared
+// down there does not exist yet when the generated
+// "void playTune(const Note *, int);" is compiled, and the build fails
+// with 'Note' does not name a type. Pair above is fine for exactly the
+// same reason in reverse: it is already declared before that point.
+struct Note { unsigned int hz, ms; };
 
 // ---------------------------- relays ----------------------------
 
@@ -376,6 +416,57 @@ void readSerial() {
   }
 }
 
+// ---------------------------- buzzer ----------------------------
+
+// See the BUZZER note in the header before moving this to 34/35/36/39.
+const int PIN_BUZZER = 32;
+const int BUZZER_CH  = 4;                 // LEDC channel, nothing else uses it
+
+// struct Note is declared up with struct Pair, not here. See the note
+// there for why moving it back down breaks the build.
+
+// The LEDC API was rewritten in Arduino-ESP32 3.0: channels became
+// implicit and the calls take the pin. Both spellings are kept so
+// this compiles whichever core is installed.
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  #define BUZZER_BEGIN()  ledcAttach(PIN_BUZZER, 2000, 10)
+  #define BUZZER_TONE(f)  ledcWriteTone(PIN_BUZZER, (f))
+#else
+  #define BUZZER_BEGIN()  (ledcSetup(BUZZER_CH, 2000, 10), \
+                           ledcAttachPin(PIN_BUZZER, BUZZER_CH))
+  #define BUZZER_TONE(f)  ledcWriteTone(BUZZER_CH, (f))
+#endif
+
+// Rising: the bridge came up when you asked it to.
+const Note STARTUP[] = {{784, 90}, {988, 90}, {1319, 160}};   // G5 B5 E6
+
+// Falling: it came up when you did NOT ask it to. Same three notes
+// backwards, which is enough to tell apart from across a room.
+//
+// This is the cheap half of a diagnostic the firmware already cares
+// about — a restart mid-drive means the motors took the rail down,
+// and until now the only way to notice was watching the terminal.
+// Delete RESTART and the branch in setup() if you would rather every
+// boot sounded the same.
+const Note RESTART[] = {{1319, 90}, {988, 90}, {784, 160}};
+
+#define TUNE(t) playTune((t), sizeof(t) / sizeof((t)[0]))
+
+void playTune(const Note *notes, int count) {
+  for (int i = 0; i < count; i++) {
+    BUZZER_TONE(notes[i].hz);
+    delay(notes[i].ms);
+  }
+  BUZZER_TONE(0);                         // do not leave the pin driven
+}
+
+// The restarts that are routine. Opening the serial port resets the
+// board, so these three are expected at the start of every run —
+// car.py's _NORMAL_BOOT holds the same list for the same reason.
+bool bootExpected(esp_reset_reason_t r) {
+  return r == ESP_RST_POWERON || r == ESP_RST_EXT || r == ESP_RST_SW;
+}
+
 // ----------------------------- main -----------------------------
 
 void setup() {
@@ -398,6 +489,16 @@ void setup() {
   delay(200);
   Serial.println();
   Serial.printf("boot reason=%s\n", resetReasonName(bootReason));
+
+  // Blocking is fine here and nowhere else. The coils were released
+  // at the top of this function, the watchdog is not running yet, and
+  // nothing can send a command until loop() starts reading — so the
+  // ~340 ms this takes costs nothing that matters. It runs before
+  // lastRx is set, so the watchdog still starts from a standing start
+  // rather than immediately owing 340 ms.
+  BUZZER_BEGIN();
+  if (bootExpected(bootReason)) TUNE(STARTUP);
+  else                          TUNE(RESTART);
 
   lastRx = millis();
 }
