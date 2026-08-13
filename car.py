@@ -131,6 +131,7 @@ class Car:
         boot_delay: float = 2.0,
         command_timeout: Optional[float] = None,
         command_cooldown: float = 0.0,
+        reverse_cooldown: float = 0.0,
         swap_sides: bool = SWAP_SIDES,
         on_event: Optional[Callable[[str], None]] = _default_event,
     ):
@@ -164,10 +165,17 @@ class Car:
         # faster than that leave the state machine chasing itself.
         # Changes are refused inside the cooldown; unchanged states
         # always pass, so the keepalive still reaches the bridge.
+        #
+        # Two limits, because not every change costs the same. A
+        # reversal gets reverse_cooldown; everything gentler — arcs,
+        # stops, starts — gets command_cooldown, which can sensibly
+        # be zero.
         self.command_cooldown = command_cooldown
+        self.reverse_cooldown = max(reverse_cooldown, command_cooldown)
         self.held = 0
         self.last_command_held = False
         self._changed_at = 0.0
+        self._reversed_at = 0.0
 
         self.swap_sides = swap_sides
         self._watchdog_s = 0.4            # replaced by what the bridge reports
@@ -335,11 +343,49 @@ class Car:
         """Send a relay state without it counting as caller activity."""
         return self._send("R {} {} {} {}".format(*state))
 
-    def cooldown_remaining(self) -> float:
-        """Seconds until the next state change would be accepted."""
-        if self.command_cooldown <= 0:
-            return 0.0
-        return max(0.0, self.command_cooldown - (time.monotonic() - self._changed_at))
+    @staticmethod
+    def _is_reversal(old: tuple[int, int, int, int],
+                     new: tuple[int, int, int, int]) -> bool:
+        """Does either motor turn one way and then the other?
+
+        The distinction the cooldown cares about. Reversing a turning
+        motor fights its own momentum and breaks a contact carrying
+        the current that fight draws. Dropping a track to idle, or
+        starting one from rest, does neither — an arc is a gentle
+        thing and does not deserve the same wait.
+
+        Matches how the firmware decides to insert its dead-time, so
+        the two layers agree on what counts as harsh.
+        """
+        turning = ((1, 0), (0, 1))          # the two driving states
+        for i in (0, 2):                    # each relay pair, one per motor
+            was, now_ = old[i:i + 2], new[i:i + 2]
+            if was in turning and now_ in turning and was != now_:
+                return True
+        return False
+
+    def cooldown_remaining(self, state: Optional[tuple] = None) -> float:
+        """Seconds until a change would be accepted.
+
+        Each limit runs off its own clock, which is the point. The
+        reversal limit is recovery time *after* a reversal, not a
+        readiness check before one — a motor is no easier to reverse
+        for having been driving a while, so making it wait on the
+        last arc protects nothing and only makes the controls sticky.
+        What is worth preventing is reversing again immediately, back
+        and forth, while the contacts are still hot.
+
+        Without an argument, reports the worst case.
+        """
+        now = time.monotonic()
+        wait = self.command_cooldown - (now - self._changed_at)
+
+        reversing = True
+        if state is not None and self._last_state is not None:
+            reversing = self._is_reversal(self._last_state, state)
+        if reversing:
+            wait = max(wait, self.reverse_cooldown - (now - self._reversed_at))
+        return max(0.0, wait)
 
     def _set(self, state: tuple[int, int, int, int], force: bool = False) -> str:
         """Apply a relay state, subject to the cooldown.
@@ -353,12 +399,14 @@ class Car:
         self._last_command_at = now
 
         changing = self._last_state is not None and state != self._last_state
-        if changing and not force and self.cooldown_remaining() > 0:
+        if changing and not force and self.cooldown_remaining(state) > 0:
             self.held += 1
             self.last_command_held = True
             return self._apply(self._last_state)   # type: ignore[arg-type]
 
         self.last_command_held = False
+        if changing and self._is_reversal(self._last_state, state):  # type: ignore[arg-type]
+            self._reversed_at = now
         if state != self._last_state:
             self._changed_at = now
         self._last_state = state
@@ -368,19 +416,55 @@ class Car:
         """Set IN1..IN4 directly. Returns the applied state line."""
         return self._set((int(a), int(b), int(c), int(d)))
 
-    def drive(self, left: int, right: int) -> str:
-        """Set each track to -1 (reverse), 0 (stop) or +1 (forward).
-
-        left and right mean the tank's own left and right. See
-        SWAP_SIDES for how those reach the relay pairs.
-        """
+    def _drive(self, left: int, right: int, force: bool = False) -> str:
         if left not in _DIR or right not in _DIR:
             raise ValueError("left and right must be -1, 0 or 1")
         if self.swap_sides:
             left, right = right, left
         a, b = _DIR[left]
         c, d = _DIR[right]
-        return self.relays(a, b, c, d)
+        return self._set((a, b, c, d), force=force)
+
+    def drive(self, left: int, right: int) -> str:
+        """Set each track to -1 (reverse), 0 (stop) or +1 (forward).
+
+        left and right mean the tank's own left and right. See
+        SWAP_SIDES for how those reach the relay pairs.
+        """
+        return self._drive(left, right)
+
+    def soft_arc(self, side: str, seconds: float = 1.0) -> bool:
+        """Steer by dropping one track briefly, then put it back.
+
+        Cutting the inside track lets the outside one pull the nose
+        round. Nothing reverses, so no contact has to break a
+        reversing current and no gearbox is asked to change direction
+        under load — the gentlest turn this drivetrain can make.
+
+        The tracks go back to whatever they were doing before, so a
+        turn is a correction to a course rather than a new state to
+        remember to cancel. Returns False if the cooldown held it,
+        leaving nothing changed.
+        """
+        if side not in ("left", "right"):
+            raise ValueError("side must be 'left' or 'right'")
+
+        before = self._last_state
+        # Inside track idles, outside track drives.
+        self.drive(0, 1) if side == "left" else self.drive(1, 0)
+        if self.last_command_held:
+            return False
+
+        time.sleep(seconds)
+
+        # Forced: the arc itself just started the clock, and making
+        # the tracks wait it out would leave one of them idling with
+        # nobody having asked for that.
+        if before is None:
+            self.stop()
+        else:
+            self._set(before, force=True)
+        return True
 
     def forward(self) -> str:
         return self.drive(1, 1)

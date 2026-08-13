@@ -27,34 +27,47 @@ import tty
 
 from car import Car, BridgeError, boot_warning
 
-# key -> (label, (left, right))
+# key -> (label, (left, right)).  Latching states.
 KEYS = {
-    "w": ("forward",    (1, 1)),
-    "s": ("backward",   (-1, -1)),
-    "a": ("spin left",  (-1, 1)),
-    "d": ("spin right", (1, -1)),
-    "q": ("arc left",   (0, 1)),
-    "e": ("arc right",  (1, 0)),
-    " ": ("stop",       (0, 0)),
+    "w": ("forward",   (1, 1)),
+    "s": ("backward",  (-1, -1)),
+    "q": ("arc left",  (0, 1)),
+    "e": ("arc right", (1, 0)),
+    " ": ("stop",      (0, 0)),
 }
+
+# key -> side.  Timed nudges, not states — see Car.soft_arc.
+ARCS = {"a": "left", "d": "right"}
 
 HELP = """
   w  forward        s  backward
-  a  spin left      d  spin right
-  q  arc left       e  arc right
+
+  q  arc left       e  arc right      held until you press something else
+  a  soft arc left  d  soft arc right --arc-time seconds, then back
 
   space  stop       x  quit
   r      unstick    i  show config and relay operation counts
 
-Commands latch until you press another key.
+Both arcs steer the same way — the inside track idles and the outside
+one pulls the nose round. They differ only in who ends them.
 
-Direction changes are rate limited (--cooldown). A press inside that
-window shows HELD and does nothing — the contacts need the time, and
-spamming keys only leaves the state chasing itself. Space is never
-held.
+  q / e   latch. The tank keeps turning until you press w, space, or
+          something else. Use them to come round a long way.
+
+  a / d   end themselves. One track drops out for --arc-time, then
+          both go back to exactly what they were doing. Use them to
+          correct a heading without giving up your course.
+
+There is no spin. Opposing the tracks reverses a motor under load,
+which is the harshest thing this drivetrain does to its contacts, and
+an arc reaches the same heading without it.
+
+Reversals wait --reverse-cooldown before they are allowed again;
+arcs, stops and starts wait only --cooldown, nothing by default. A
+press inside a window shows HELD. Space is never held.
 
 r drives backwards briefly, then stops. That clears a relay that has
-stayed engaged, usually after an arc. Expect the rover to move.
+stayed engaged. Expect the rover to move.
 
 relays[...] is what the bridge reports as APPLIED. Pressing space
 should show relays[0 0 0 0]. If it does and the tracks keep turning,
@@ -150,15 +163,22 @@ def main() -> int:
     ap.add_argument("--port", default=None, help="serial device")
     ap.add_argument("--selftest", action="store_true",
                     help="click each relay in turn, then stop (motors off!)")
-    ap.add_argument("--cooldown", type=float, default=2.0,
-                    help="seconds between direction changes; presses inside "
-                         "this window are held (0 disables)")
+    ap.add_argument("--reverse-cooldown", type=float, default=0.5,
+                    help="seconds before a motor may be reversed again; the "
+                         "one change that fights the motor's own momentum")
+    ap.add_argument("--cooldown", type=float, default=0.0,
+                    help="seconds before any gentler change — arc, stop, "
+                         "start — is allowed")
+    ap.add_argument("--arc-time", type=float, default=1.0,
+                    help="seconds to hold an arc before the tracks go back")
     ap.add_argument("--unstick-time", type=float, default=0.5,
                     help="seconds to drive backwards when r is pressed")
     args = ap.parse_args()
 
     try:
-        car = Car(port=args.port, command_cooldown=args.cooldown)
+        car = Car(port=args.port,
+                  command_cooldown=args.cooldown,
+                  reverse_cooldown=args.reverse_cooldown)
     except BridgeError as e:
         print(f"could not open the bridge: {e}", file=sys.stderr)
         return 1
@@ -198,6 +218,18 @@ def main() -> int:
                     try:
                         car.unstick(args.unstick_time)
                         print(" done, stopped        ")
+                    except BridgeError as e:
+                        print(f"\rerror: {e}")
+                    continue
+                if key in ARCS:
+                    side = ARCS[key]
+                    print(f"\rsoft arc {side:<6} inside track idling ...", end="")
+                    sys.stdout.flush()
+                    try:
+                        if car.soft_arc(side, args.arc_time):
+                            print(" back on course      ")
+                        else:
+                            print(f" HELD {car.cooldown_remaining():.1f}s      ")
                     except BridgeError as e:
                         print(f"\rerror: {e}")
                     continue
