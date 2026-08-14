@@ -561,9 +561,11 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        # Camera first: lowering the mast is a bridge command, so the
+        # bridge has to still be open when it goes out.
+        cam.close()
         if car is not None:
             car.close()
-        cam.close()
         print("\nstopped")
 
     return 0

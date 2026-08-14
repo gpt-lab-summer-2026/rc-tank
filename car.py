@@ -21,6 +21,7 @@ Needs pyserial:  pip install pyserial
 
 from __future__ import annotations
 
+import atexit
 import sys
 import threading
 import time
@@ -237,6 +238,8 @@ class Car:
         self.held = 0
         self.last_command_held = False
         self._changed_at = 0.0
+        self.mast_angle: Optional[int] = None
+        self._mast_atexit = False
         self._reversed_at = 0.0
 
         self.swap_sides = swap_sides
@@ -580,7 +583,38 @@ class Car:
         out rather than through _set, which exists to protect contacts
         the servo does not have.
         """
-        return self._send(f"V {int(angle)}")
+        angle = int(angle)
+
+        # Recorded BEFORE the write, not after. If Ctrl+C lands between
+        # the write and the reply the mast is probably already moving,
+        # and a redundant stow at exit costs nothing while a missed one
+        # leaves the camera up.
+        self.mast_angle = angle
+
+        # Whatever else happens now, something will put it down. atexit
+        # runs on a normal return, on sys.exit, and while unwinding an
+        # unhandled exception — which is what a Ctrl+C becomes wherever
+        # it happens to land, including inside Camera's constructor
+        # before any caller holds a reference to anything.
+        if not self._mast_atexit:
+            atexit.register(self._stow_mast)
+            self._mast_atexit = True
+
+        return self._send(f"V {angle}")
+
+    def _stow_mast(self) -> None:
+        """Lower the mast if it is raised. Safe to call repeatedly.
+
+        Deliberately forgiving: this runs during interpreter shutdown
+        and while cleaning up after failures, where raising would
+        replace whatever actually went wrong with a serial error.
+        """
+        try:
+            if (self._ser is not None and self.mast_angle is not None
+                    and self.mast_angle > self.MAST_DOWN):
+                self.mast(self.MAST_DOWN)
+        except Exception:
+            pass
 
     def camera_up(self, settle: float = 0.6) -> str:
         """Raise the mast and wait for it to actually get there.
@@ -679,6 +713,12 @@ class Car:
     # ----------------------------------------------------- lifecycle
 
     def close(self) -> None:
+        # The mast comes down before the port closes. Every caller that
+        # tears down in the other order — bridge first, camera second —
+        # would otherwise be asking a shut serial port to move a servo,
+        # and both scripts here used to do exactly that.
+        self._stow_mast()
+
         self._stop_evt.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)

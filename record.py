@@ -261,8 +261,12 @@ class Camera:
         if self._mast is not None:
             try:
                 self._mast.camera_down()
-            except Exception:
-                pass          # shutting down; the bridge may already be gone
+            except Exception as e:
+                # Worth a line. A mast left up is the kind of thing you
+                # discover by finding the camera still raised tomorrow,
+                # and this used to fail silently every single run
+                # because the bridge was closed first.
+                print(f"  !! camera mast did not lower: {e}", file=sys.stderr)
 
 
 # ------------------------------------------------------------ input
@@ -592,9 +596,11 @@ def main() -> int:
         pass
     finally:
         source.close()
+        # Camera before bridge: lowering the mast is a bridge command,
+        # so the port has to still be open when it goes out.
+        cam.close()
         if car is not None:
             car.close()
-        cam.close()
         rec.close()
 
         print("\n")
