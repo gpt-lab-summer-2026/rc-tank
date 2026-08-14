@@ -46,8 +46,8 @@ from collections import Counter, deque
 import cv2
 import numpy as np
 
-from car import BridgeError, Car, boot_warning
-from record import CAMERA_ROTATION, Camera, label_of
+from car import BridgeError, Car, SoftArc, boot_warning
+from record import CAMERA_ROTATION, Camera
 
 # ------------------------------------------------------- floor model
 
@@ -207,19 +207,66 @@ def regions(profile: np.ndarray, pct: int = 25) -> tuple[float, float, float]:
 # ------------------------------------------------------------ policy
 
 
+# Track pair for each move that is a single held state. Soft arcs are
+# not in here — they are not one state, see SoftArc.
+#
+# Yaw, for the two that are easy to get backwards: (-1, 0) runs the
+# left track back against a stopped right one, which swings the NOSE
+# left while the tank retreats. record.py's LABELS calls that same
+# pair "rev_arc_right", naming it for where a reversing driver sees
+# the tail go. Same motion, two seats.
+TRACKS = {
+    "forward":       (1, 1),
+    "reverse":       (-1, -1),
+    "stop":          (0, 0),
+    "arc_left":      (0, 1),
+    "arc_right":     (1, 0),
+    "back_arc_left": (-1, 0),
+    "back_arc_right": (0, -1),
+}
+
+
+def tracks_for(move: str, now: float, soft: SoftArc) -> tuple[int, int]:
+    """Resolve a move name to the pair of track directions for now."""
+    if move.startswith("soft_"):
+        return soft.tracks(move.endswith("right"), now)
+    return TRACKS[move]
+
+
 class Policy:
-    """Free space in, relay directions out."""
+    """Free space in, a named move out.
+
+    Turns are arcs, not spins. Driving one track against the other
+    pivots on the spot and is the obvious way to turn a tank, but this
+    chassis does it badly — and it is the hardest move there is on the
+    contacts, since both pairs reverse at once.
+
+    An arc drives one track and leaves the other stopped. That turns
+    this tank better and halves the relay work, at the cost of no
+    longer turning on the spot: a forward arc travels while it turns.
+    Which is fine when there is room ahead and precisely wrong when
+    there is not, so a badly blocked centre gets a REVERSE arc — still
+    one track, still a proper turn, but retreating from the thing it
+    is turning away from rather than creeping into it.
+    """
 
     def __init__(self, go: float, turn_margin: float, stuck_after: float,
-                 reverse_for: float):
+                 reverse_for: float, soft_margin: float = 0.0,
+                 back_below: float = 0.35):
         self.go = go                      # centre clearance to keep going
         self.turn_margin = turn_margin    # how much better a side must be
         self.stuck_after = stuck_after
         self.reverse_for = reverse_for
+        # How lopsided the sides must be before nudging away from the
+        # closer one while still going forward. 0 disables it.
+        self.soft_margin = soft_margin
+        # Below this fraction of go, a forward arc would drive into
+        # whatever is ahead, so turn while backing instead.
+        self.back_below = back_below
         self._turning_since = None
         self._reverse_until = None
 
-    def decide(self, left, centre, right, now) -> tuple[int, int]:
+    def decide(self, left, centre, right, now) -> str:
         # A reverse runs for a fixed time and then hands back to the
         # normal rules. Backing up until the view ahead clears reads
         # as the sensible version and is not: the camera faces the
@@ -227,26 +274,42 @@ class Policy:
         # about where the car is going.
         if self._reverse_until is not None:
             if now < self._reverse_until:
-                return (-1, -1)
+                return "reverse"
             self._reverse_until = None
             self._turning_since = None    # turning gets a fresh chance
 
         if centre >= self.go:
             self._turning_since = None
-            return (1, 1)
+            # Room ahead. Drift away from whichever side is closer
+            # rather than holding course until it becomes an obstacle
+            # and forces a hard turn. Costs contact operations that
+            # going straight does not, which is why soft_margin has
+            # to be asked for.
+            if self.soft_margin > 0:
+                if left - right > self.soft_margin:
+                    return "soft_arc_left"
+                if right - left > self.soft_margin:
+                    return "soft_arc_right"
+            return "forward"
 
         if self._turning_since is None:
             self._turning_since = now
         elif now - self._turning_since > self.stuck_after:
-            # Pivoting has not found a way out. Reverse instead.
+            # Turning has not found a way out. Straight back instead.
             self._reverse_until = now + self.reverse_for
-            return (-1, -1)
+            return "reverse"
 
-        # Blocked ahead: spin toward the side with more room. Ties and
+        # Blocked ahead: turn toward the side with more room. Ties and
         # near-ties break left so the car does not dither in a corner.
-        if right > left + self.turn_margin:
-            return (1, -1)
-        return (-1, 1)
+        left_is_better = not (right > left + self.turn_margin)
+
+        # Almost nothing ahead. A forward arc here would turn while
+        # driving into the thing being turned away from, so give up the
+        # ground instead and yaw the same way going backwards.
+        if centre < self.go * self.back_below:
+            return "back_arc_left" if left_is_better else "back_arc_right"
+
+        return "arc_left" if left_is_better else "arc_right"
 
 
 class Smoother:
@@ -259,10 +322,10 @@ class Smoother:
     def __init__(self, window: int, min_interval: float):
         self.buf: deque = deque(maxlen=window)
         self.min_interval = min_interval
-        self.current = (0, 0)
+        self.current = "stop"
         self.changed_at = 0.0
 
-    def update(self, decision, now) -> tuple[int, int]:
+    def update(self, decision: str, now: float) -> str:
         self.buf.append(decision)
         if len(self.buf) < self.buf.maxlen:
             return self.current
@@ -277,7 +340,7 @@ class Smoother:
 # ------------------------------------------------------------- debug
 
 
-def annotate(bgr, mask, prof, regs, decision):
+def annotate(bgr, mask, prof, regs, move):
     out = bgr.copy()
     green = np.zeros_like(out)
     green[:, :, 1] = mask
@@ -297,7 +360,7 @@ def annotate(bgr, mask, prof, regs, decision):
             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
         )
     cv2.putText(
-        out, label_of(*decision), (8, h - 10),
+        out, move, (8, h - 10),
         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
     )
     return out
@@ -316,6 +379,18 @@ def main() -> int:
     ap.add_argument("--turn-margin", type=float, default=0.05,
                     help="how much clearer one side must be, as a fraction")
     ap.add_argument("--threshold", type=int, default=40, help="floor match strictness 0-255")
+    ap.add_argument("--soft-margin", type=float, default=0.0,
+                    help="how much clearer one side must be before drifting away "
+                         "from the other while still going forward, as a fraction "
+                         "of frame height. 0 disables the soft arc")
+    ap.add_argument("--soft-period", type=float, default=1.2,
+                    help="seconds per soft-arc cycle; shorter turns harder and "
+                         "costs contact life faster")
+    ap.add_argument("--soft-duty", type=float, default=0.30,
+                    help="fraction of each soft-arc cycle spent arcing")
+    ap.add_argument("--back-below", type=float, default=0.35,
+                    help="turn while REVERSING when centre clearance falls below "
+                         "this fraction of --go, instead of arcing forward into it")
     ap.add_argument("--close", type=int, default=11,
                     help="fill not-floor gaps thinner than this many pixels — wood "
                          "grain and grout, not obstacles. Raise until the floor "
@@ -381,12 +456,28 @@ def main() -> int:
     floor.learn(cam.frame())
     print(f"learned: {getattr(floor, 'why', floor.chosen)}\n")
 
+    # A cooldown longer than the arc pulse turns every pulse into a
+    # resend of the previous state: the tank drives straight and
+    # nothing says why. Cheaper to hear about it here.
+    if args.soft_margin > 0 and car is not None:
+        probe = SoftArc(period=args.soft_period, duty=args.soft_duty)
+        if probe.swallowed_by(getattr(car, "command_cooldown", 0.0)):
+            print(f"  !! command_cooldown {car.command_cooldown:.2f}s is longer than the "
+                  f"soft-arc pulse\n     ({args.soft_period*args.soft_duty:.2f}s) — "
+                  f"the arc would never reach the relays. Soft arc disabled.\n")
+            args.soft_margin = 0.0
+        else:
+            print(f"  soft arc on: ~{probe.ops_per_second:.1f} contact ops/sec "
+                  f"while correcting\n")
+
     frame = cam.frame()
     h = frame.shape[0]
     go_px = args.go * h
     margin_px = args.turn_margin * h
 
-    policy = Policy(go_px, margin_px, args.stuck_after, args.reverse_for)
+    policy = Policy(go_px, margin_px, args.stuck_after, args.reverse_for,
+                    soft_margin=args.soft_margin * h, back_below=args.back_below)
+    soft = SoftArc(period=args.soft_period, duty=args.soft_duty)
     smoother = Smoother(args.window, args.min_interval)
 
     period = 1.0 / args.fps
@@ -407,8 +498,8 @@ def main() -> int:
             prof = free_profile(mask)
             regs = regions(prof)
 
-            raw = policy.decide(*regs, now)
-            decision = smoother.update(raw, now)
+            move = smoother.update(policy.decide(*regs, now), now)
+            decision = tracks_for(move, now, soft)
 
             # Resent every tick, not only when it changes. The firmware
             # ignores a state it has already applied, so this costs no
@@ -440,14 +531,14 @@ def main() -> int:
                 resets += f"  HELD {car.cooldown_remaining():.1f}s"
             print(
                 f"\rL {regs[0]:5.0f}  C {regs[1]:5.0f}  R {regs[2]:5.0f}   "
-                f"go>{go_px:.0f}   {label_of(*decision):<12}{resets}",
+                f"go>{go_px:.0f}   {move:<15}{resets}",
                 end="",
             )
             sys.stdout.flush()
 
             if args.debug_image and now - last_debug > 1.0:
                 last_debug = now
-                cv2.imwrite(args.debug_image, annotate(frame, mask, prof, regs, decision))
+                cv2.imwrite(args.debug_image, annotate(frame, mask, prof, regs, move))
 
     except KeyboardInterrupt:
         pass

@@ -85,10 +85,16 @@ def mix(steer: float, throttle: float, dz: float) -> tuple[int, int]:
     base = 1 if throttle > dz else (-1 if throttle < -dz else 0)
     turn = 1 if steer > dz else (-1 if steer < -dz else 0)
 
-    if base and turn:                       # arc: inner wheel stops
+    if base and turn:                       # arc: inner track stops
         return (base, 0) if turn > 0 else (0, base)
-    if turn:                                # spin on the spot
-        return (turn, -turn)
+    if turn:
+        # Steering with no throttle. This used to spin the tracks
+        # against each other; it now arcs forward instead, because
+        # this chassis turns better on one track and a spin is twice
+        # the contact work. The cost is that steering from a standstill
+        # now creeps forward rather than staying put — there is no
+        # third option, since turning at all means driving a track.
+        return (1, 0) if turn > 0 else (0, 1)
     return (base, base)
 
 
@@ -242,13 +248,13 @@ class KeyboardInput:
     KEYS = {
         "w": (1, 1),
         "s": (-1, -1),
-        "a": (-1, 1),
-        "d": (1, -1),
-        "q": (0, 1),
-        "e": (1, 0),
+        "a": (0, 1),          # arc left, was spin left
+        "d": (1, 0),          # arc right, was spin right
+        "z": (-1, 0),         # yaws left, backing
+        "c": (0, -1),         # yaws right, backing
         " ": (0, 0),
     }
-    HELP = "w/s drive  a/d spin  q/e arc  space stop  x quit"
+    HELP = "w/s drive  a/d arc  z/c back arc  space stop  x quit"
 
     def __init__(self):
         self.left = 0

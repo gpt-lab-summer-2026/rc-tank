@@ -108,6 +108,68 @@ _DIR = {1: (1, 0), 0: (0, 0), -1: (0, 1)}
 SWAP_SIDES = True
 
 
+class SoftArc:
+    """A turn gentler than the relays can express in any single state.
+
+    Each track has three states, so the widest turn available as a
+    held command is a full arc — one track stopped — and on this
+    chassis that is still a hard turn. Anything gentler has to be
+    built in TIME rather than in voltage: hold forward for most of a
+    cycle, interrupt it with a short arc pulse, repeat.
+
+    -------------------------------------------------------------
+    THIS SPENDS CONTACT LIFE, AND PLAN.md ALREADY SAID SO
+
+    PLAN.md rejects pulse-and-coast outright, pricing it at roughly
+    triple the contact wear and a dead relay board inside three hours.
+    That verdict stands for what it judged: duty-cycling every move,
+    continuously, to fake speed control.
+
+    A soft arc is a narrower bargain than the one it refused. Only the
+    inner track's pair switches, so a cycle costs two contact
+    operations rather than eight, and it runs only while actually
+    correcting course rather than the whole time the tank is moving.
+    At the default 1.2 s period that is about 1.7 operations per
+    second while active, against zero for a hard arc simply held.
+
+    Narrower, but not free, and bought to paper over something the
+    hardware does not have. Use it to correct course on open floor.
+    Do not use it to go slower — that is the exact case PLAN.md
+    already costed and turned down.
+
+    -------------------------------------------------------------
+    The phase free-runs off the clock rather than being stepped, so it
+    holds no state, cannot drift, and answers identically for every
+    caller asking about the same instant.
+    """
+
+    def __init__(self, period: float = 1.2, duty: float = 0.30):
+        self.period = period
+        self.duty = duty
+
+    def tracks(self, turn_right: bool, now: float) -> tuple[int, int]:
+        """The track pair for this instant of the cycle."""
+        if (now % self.period) < self.period * self.duty:
+            return (1, 0) if turn_right else (0, 1)     # the arc pulse
+        return (1, 1)                                   # and cruise between
+
+    @property
+    def ops_per_second(self) -> float:
+        """Contact operations per second while this is running."""
+        return 2.0 / self.period
+
+    def swallowed_by(self, cooldown: float) -> bool:
+        """Would Car's cooldown hold the pulses instead of passing them?
+
+        A cooldown at least as long as the shorter half of the cycle
+        turns every pulse into a resend of the previous state, so the
+        arc silently never happens and the tank drives straight. Worth
+        catching at startup rather than in a corridor.
+        """
+        shorter = self.period * min(self.duty, 1.0 - self.duty)
+        return cooldown > 0 and cooldown >= shorter
+
+
 class Car:
     """Serial link to the relay bridge.
 
@@ -480,11 +542,29 @@ class Car:
         return self.drive(1, -1)
 
     def arc_left(self) -> str:
-        """Inner wheel stopped — a wider, gentler turn."""
+        """Inner track stopped — yaws left, and travels forward doing it."""
         return self.drive(0, 1)
 
     def arc_right(self) -> str:
+        """Yaws right, travelling forward."""
         return self.drive(1, 0)
+
+    # The reverse arcs yaw the same way as their forward namesakes but
+    # retreat instead of advancing, which is what makes them the turn
+    # to use when the thing you are turning away from is in front.
+    #
+    # NOTE the naming. record.py's LABELS calls (-1, 0) "rev_arc_right"
+    # because a driver reversing with the stick right sees the REAR
+    # swing right. The nose goes left. Both names describe the same
+    # motion from different seats; these two are named for the nose,
+    # because roam.py steers by where it wants to end up pointing.
+    def back_arc_left(self) -> str:
+        """Yaws left while backing. One track, no forward travel."""
+        return self.drive(-1, 0)
+
+    def back_arc_right(self) -> str:
+        """Yaws right while backing."""
+        return self.drive(0, -1)
 
     def stop(self) -> str:
         # Never held. Whatever else is rate-limited, stopping is not.

@@ -25,7 +25,7 @@ import termios
 import time
 import tty
 
-from car import Car, BridgeError, boot_warning
+from car import Car, BridgeError, SoftArc, boot_warning
 
 # key -> (label, (left, right)).  Latching states.
 KEYS = {
@@ -201,11 +201,28 @@ def main() -> int:
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     quitting = False
+    soft = SoftArc()
+    softing = None                       # (label, turn_right) while a soft arc is held
+    if soft.swallowed_by(getattr(car, "command_cooldown", 0.0)):
+        print(f"!! command_cooldown {car.command_cooldown:.2f}s exceeds the soft-arc "
+              f"pulse — q/e would drive straight. Lower it to use them.\n")
 
     try:
         tty.setcbreak(fd)
         while not quitting:
-            for key in read_keys().lower():
+            keys = read_keys().lower()
+
+            # No key this tick and a soft arc selected: keep its cycle
+            # turning. read_keys already blocks for its timeout, so
+            # this paces itself without a sleep.
+            if not keys and softing is not None:
+                try:
+                    car.drive(*soft.tracks(softing[1], time.monotonic()))
+                except BridgeError as e:
+                    print(f"\rerror: {e}")
+                continue
+
+            for key in keys:
                 if key == "x":
                     quitting = True
                     break
@@ -233,9 +250,23 @@ def main() -> int:
                     except BridgeError as e:
                         print(f"\rerror: {e}")
                     continue
+                if key in SOFT:
+                    label, turn_right = SOFT[key]
+                    softing = (label, turn_right)
+                    left, right = soft.tracks(turn_right, time.monotonic())
+                    try:
+                        car.drive(left, right)
+                    except BridgeError as e:
+                        print(f"\rerror: {e}")
+                        continue
+                    print(f"\r{label:<16} cycling   ", end="")
+                    sys.stdout.flush()
+                    continue
+
                 if key not in KEYS:
                     continue
 
+                softing = None            # any hard command ends the cycle
                 label, (left, right) = KEYS[key]
                 try:
                     reply = car.drive(left, right)
