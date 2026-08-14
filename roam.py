@@ -53,19 +53,53 @@ from record import CAMERA_ROTATION, Camera, label_of
 
 
 class FloorModel:
-    """Hue/saturation histogram of the ground, back-projected per pixel.
+    """Two-channel histogram of the ground, back-projected per pixel.
 
-    Value is deliberately excluded — brightness varies with shadow
-    and vignetting, while hue and saturation stay comparatively
-    stable across the same carpet or lino.
+    WHICH TWO CHANNELS DEPENDS ON THE FLOOR, and getting it wrong is
+    not a matter of degree — it decides whether the model has any
+    signal at all.
+
+    Hue and saturation are the right pair on a floor with actual
+    colour in it. Value is excluded there because brightness moves
+    with shadow and vignetting while hue does not.
+
+    That reasoning inverts on a pale or grey floor. Saturation is
+    what makes hue meaningful: HSV computes hue from which channel
+    is largest, so as saturation falls towards zero the ordering is
+    decided by sensor noise and lens shading rather than by colour.
+    Measured on a whitewashed pine floor, mean saturation was 9 and
+    hue spread +/-55 over its 0-180 range — that is not a colour, it
+    is a random number. Meanwhile value sat at 192 +/-7, the tightest
+    signal in the frame.
+
+    Feeding that floor an H,S histogram put 41% of the frame in bins
+    the reference patch had never seen, so two fifths of clear ground
+    read as obstacle and no threshold could rescue it: back-projection
+    returns exactly 0 for an unseen bin, and 0 fails every threshold
+    including 0.
+
+    So the pair is chosen from the patch rather than fixed in advance.
     """
 
     BINS = (24, 24)
-    RANGES = (0, 180, 0, 256)
 
-    def __init__(self, smooth: float = 0.0):
+    # channels into HSV, and the range of each, per mode.
+    MODES = {
+        "hs": ([0, 1], (0, 180, 0, 256)),
+        "sv": ([1, 2], (0, 256, 0, 256)),
+    }
+
+    # Below this mean saturation, treat the surface as grey and stop
+    # trusting hue. Well above the 9 measured on bare pine and well
+    # below anything that deserves to be called a colour, so the
+    # decision is not close in either direction.
+    ACHROMATIC_S = 40
+
+    def __init__(self, smooth: float = 0.0, mode: str = "auto"):
         self.hist = None
         self.smooth = smooth      # 0 = learn once and never change
+        self.mode = mode          # "auto" resolves on the first learn()
+        self.chosen: str | None = None if mode == "auto" else mode
 
     @staticmethod
     def patch_box(shape) -> tuple[int, int, int, int]:
@@ -73,10 +107,29 @@ class FloorModel:
         h, w = shape[:2]
         return (int(w * 0.35), int(h * 0.82), int(w * 0.65), h)
 
+    @property
+    def channels(self):
+        return self.MODES[self.chosen][0]
+
+    @property
+    def ranges(self):
+        return self.MODES[self.chosen][1]
+
     def learn(self, bgr) -> None:
         x0, y0, x1, y1 = self.patch_box(bgr.shape)
         hsv = cv2.cvtColor(bgr[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, self.BINS, self.RANGES)
+
+        # Decided once, from the first patch, and then left alone. A
+        # model that swapped channels mid-run would be comparing
+        # histograms with different axes.
+        if self.chosen is None:
+            sat = float(hsv[:, :, 1].mean())
+            self.chosen = "hs" if sat >= self.ACHROMATIC_S else "sv"
+            self.why = (f"patch saturation {sat:.0f} — "
+                        + ("has colour, using hue+saturation" if self.chosen == "hs"
+                           else "effectively grey, hue is noise, using saturation+value"))
+
+        hist = cv2.calcHist([hsv], self.channels, None, self.BINS, self.ranges)
         cv2.normalize(hist, hist, 0, 255, cv2.NORM_MINMAX)
 
         if self.hist is None or self.smooth <= 0:
@@ -87,7 +140,7 @@ class FloorModel:
     def mask(self, bgr, threshold: int = 40):
         """255 where the pixel looks like floor."""
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        back = cv2.calcBackProject([hsv], [0, 1], self.hist, self.RANGES, 1)
+        back = cv2.calcBackProject([hsv], self.channels, self.hist, self.ranges, 1)
 
         # Blur first so isolated speckles do not cut a column short,
         # then close small holes from carpet texture and specular dots.
@@ -239,6 +292,9 @@ def main() -> int:
     ap.add_argument("--turn-margin", type=float, default=0.05,
                     help="how much clearer one side must be, as a fraction")
     ap.add_argument("--threshold", type=int, default=40, help="floor match strictness 0-255")
+    ap.add_argument("--channels", default="auto", choices=("auto", "hs", "sv"),
+                    help="which two HSV channels model the floor. auto picks sv on a "
+                         "grey floor, where hue is noise, and hs where there is colour")
     ap.add_argument("--window", type=int, default=5, help="frames in the majority vote")
     ap.add_argument("--min-interval", type=float, default=0.2,
                     help="seconds between relay changes")
@@ -293,9 +349,9 @@ def main() -> int:
 
     print("\nlearning the floor — keep a metre of clear ground ahead")
     time.sleep(1.0)
-    floor = FloorModel(smooth=args.adapt)
+    floor = FloorModel(smooth=args.adapt, mode=args.channels)
     floor.learn(cam.frame())
-    print("learned\n")
+    print(f"learned: {getattr(floor, 'why', floor.chosen)}\n")
 
     frame = cam.frame()
     h = frame.shape[0]

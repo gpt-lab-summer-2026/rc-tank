@@ -438,9 +438,9 @@ const int BUZZER_CH  = 4;                 // LEDC channel, nothing else uses it
 #endif
 
 // Rising: the bridge came up when you asked it to.
-const Note STARTUP[] = {{784, 90}, {988, 90}, {1319, 160}};   // G5 B5 E6
+const Note STARTUP[] = {{784, 90}, {988, 90}, {784, 160}};   // G5 B5 E6
 
-// Falling: it came up when you did NOT ask it to. Same three notes
+// Falling: it came up when you  did NOT ask it to. Same three notes
 // backwards, which is enough to tell apart from across a room.
 //
 // This is the cheap half of a diagnostic the firmware already cares

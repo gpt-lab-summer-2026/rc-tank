@@ -85,57 +85,60 @@ def main() -> int:
         print("  close to grey. Hue is numerically unstable on grey pixels, so")
         print("  the H,S histogram has little real signal to work with.")
 
-    model = FloorModel()
-    model.learn(frame)
-    hist = model.hist
-    occupied = int((hist > 0).sum())
-    total = hist.size
-    vals = hist[hist > 0]
+    # Both channel pairs, on the same frame, so the choice is measured
+    # rather than argued about.
+    results = {}
+    for mode in ("hs", "sv"):
+        model = FloorModel(mode=mode)
+        model.learn(frame)
+        hist = model.hist
+        vals = hist[hist > 0]
 
-    print(f"\nhistogram: {occupied}/{total} bins populated")
-    print(f"  values after normalise:  min {vals.min():5.1f}   "
-          f"median {np.median(vals):5.1f}   max {vals.max():5.1f}")
-    for t in (40, 10, 2):
-        print(f"    bins above threshold {t:>2}: {int((hist > t).sum())}")
+        back = cv2.calcBackProject([hsv], model.channels, hist, model.ranges, 1)
+        zeros = (back == 0).mean() * 100
 
-    back = cv2.calcBackProject([hsv], [0, 1], hist, FloorModel.RANGES, 1)
-    print(f"\nback-projection before blur:")
-    print(f"  patch       min {back[y0:y1, x0:x1].min():3d}  "
-          f"mean {back[y0:y1, x0:x1].mean():6.1f}  max {back[y0:y1, x0:x1].max():3d}")
-    print(f"  whole frame min {back.min():3d}  mean {back.mean():6.1f}  max {back.max():3d}")
-    print(f"  fraction of frame that is exactly 0 (colour never seen): "
-          f"{(back == 0).mean()*100:.1f}%")
-
-    print(f"\n{'thresh':>6} {'%frame floor':>13} {'patch matches itself':>21} "
-          f"{'L':>6} {'C':>6} {'R':>6}")
-    for t in (40, 20, 10, 5, 2):
-        m = model.mask(frame, t)
-        L, C, R = regions(free_profile(m))
-        print(f"{t:>6} {(m>0).mean()*100:>12.1f}% {(m[y0:y1, x0:x1]>0).mean()*100:>20.1f}% "
-              f"{L:>6.0f} {C:>6.0f} {R:>6.0f}")
+        print(f"\n=== {mode.upper()} "
+              f"({'hue+saturation, the original' if mode == 'hs' else 'saturation+value'}) ===")
+        print(f"  {int((hist > 0).sum()):>3}/{hist.size} bins populated; "
+              f"after normalise min {vals.min():.1f} median {np.median(vals):.1f} max {vals.max():.1f}")
+        print(f"  back-projects to exactly 0 over {zeros:5.1f}% of the frame "
+              f"(a colour the patch never held)")
+        print(f"  {'thresh':>6} {'%frame floor':>13} {'patch self':>11} "
+              f"{'L':>6} {'C':>6} {'R':>6}")
+        for t in (40, 20, 10, 5, 2):
+            m = model.mask(frame, t)
+            L, C, R = regions(free_profile(m))
+            if t == 40:
+                results[mode] = ((m > 0).mean(), (m[y0:y1, x0:x1] > 0).mean(), C)
+            print(f"  {t:>6} {(m>0).mean()*100:>12.1f}% {(m[y0:y1,x0:x1]>0).mean()*100:>10.1f}% "
+                  f"{L:>6.0f} {C:>6.0f} {R:>6.0f}")
 
     print(f"\n  go> is {0.45*h:.0f} at the default --go 0.45")
+    print(f"  roam.py would pick '{'hs' if sat >= FloorModel.ACHROMATIC_S else 'sv'}' "
+          f"here on --channels auto (patch saturation {sat:.0f}, "
+          f"cutoff {FloorModel.ACHROMATIC_S})")
 
     # ---------------------------------------------------------- verdict
-    m40 = model.mask(frame, 40)
-    self40 = (m40[y0:y1, x0:x1] > 0).mean()
+    hs_frame, hs_self, _ = results["hs"]
+    sv_frame, _, _ = results["sv"]
     print("\nverdict:")
-    if self40 < 0.8:
-        print("  The patch does not match itself. The model is the problem, not")
-        print("  the ground. Most likely the patch spans more than one surface —")
-        print("  check the saved frame for the car's own chassis, a shadow edge,")
-        print("  or a bright streak inside the cyan box — which splits the")
-        print("  histogram so that no single colour dominates.")
-    elif (m40 > 0).mean() < 0.5:
-        print("  The patch matches itself but the rest of the floor does not, so")
-        print("  the floor is not one colour to this model. On a grey surface")
-        print("  that usually means hue is noise and H,S cannot separate floor")
-        print("  from anything else. Value would carry the signal here, and it")
-        print("  is deliberately excluded — see FloorModel's docstring.")
+    if hs_self < 0.8:
+        print("  The patch does not match itself even on the frame it was built")
+        print("  from. That is a broken model, not a hard scene — check the saved")
+        print("  frame for the car's own chassis or a shadow edge inside the box.")
+    elif hs_frame < 0.7 and sv_frame > hs_frame + 0.15:
+        print(f"  H,S calls {(1-hs_frame)*100:.0f}% of this frame an obstacle; S,V calls")
+        print(f"  {(1-sv_frame)*100:.0f}%. Hue is carrying noise on this floor and value is")
+        print("  carrying the signal. Run roam.py with --channels sv, or leave it")
+        print("  on auto, which picks the same thing from the saturation alone.")
     else:
-        print("  Perception looks reasonable on this frame. If roam.py still")
-        print("  refuses to drive, compare C above against go> — the clearance")
-        print("  needed may simply be more than this camera pitch can ever see.")
+        print("  Both channel pairs behave similarly here, so the channel choice")
+        print("  is not what is stopping it. Compare C above against go>: the")
+        print("  clearance being demanded may exceed what this camera pitch sees.")
+
+    print("\n  CAVEAT: this frame is all floor, so the numbers above only show")
+    print("  false obstacles. They say nothing about whether real obstacles are")
+    print("  still rejected. Put a shoe in view and run it again before driving.")
     return 0
 
 
