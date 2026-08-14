@@ -574,7 +574,7 @@ class Car:
     # Angles, not directions. The mast is at 0 stowed and 90 raised;
     # anything else in 0-180 is reachable and unused.
     MAST_DOWN = 0
-    MAST_UP = 90
+    MAST_UP = 125
 
     def mast(self, angle: int) -> str:
         """Point the camera mast servo. Negative lets it go limp.

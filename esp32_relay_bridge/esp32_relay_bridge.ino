@@ -309,7 +309,7 @@ void targetsOff() {
 // put struct Note up with struct Pair.
 // ---------------------------- servo -----------------------------
 
-// Camera mast. 0 lowers it, 90 lifts it; the rest of the 0-180 range
+// Camera mast. 0 lowers it, 125 lifts it; the rest of the 0-180 range
 // is reachable but nothing here asks for it.
 const int PIN_SERVO   = 13;
 const int SERVO_CH    = 6;                // its own LEDC timer, not the buzzer's
