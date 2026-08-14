@@ -25,7 +25,7 @@ import termios
 import time
 import tty
 
-from car import Car, BridgeError, SoftArc, boot_warning
+from car import Car, BridgeError, boot_warning
 
 # key -> (label, (left, right)).  Latching states.
 KEYS = {
@@ -39,6 +39,51 @@ KEYS = {
 # key -> side.  Timed nudges, not states — see Car.soft_arc.
 ARCS = {"a": "left", "d": "right"}
 
+# Camera mast. t and g are the two presets; the nudges exist so the
+# raised angle can be dialled in against the real linkage without
+# editing car.py and restarting, which is otherwise a reflash-speed
+# loop for a one-number question.
+#
+# v lets the servo go limp. That is the thing to reach for if holding
+# the mast up is what starts browning out the 5V rail — a servo under
+# load draws current for as long as it is asked to hold.
+MAST_STEP = 5
+MAST = {
+    "t": "up",
+    "g": "down",
+    "v": "limp",
+    "+": MAST_STEP,  "=": MAST_STEP,     # = so it works without shift
+    "-": -MAST_STEP, "_": -MAST_STEP,
+}
+
+
+def mast_key(car: Car, action) -> str:
+    """Apply one mast keypress and describe where the mast ended up."""
+    if action == "up":
+        # settle=0 because the operator is watching it move and does
+        # not need the key loop to go deaf for most of a second.
+        car.camera_up(settle=0.0)
+    elif action == "down":
+        car.camera_down()
+    elif action == "limp":
+        car.mast(-1)
+    else:
+        # Nudging from limp, or from never-commanded, starts at the
+        # raised preset — dialling that angle in is the only reason to
+        # nudge at all.
+        base = car.mast_angle
+        if base is None or base < 0:
+            base = Car.MAST_UP
+        car.mast(max(0, min(180, base + action)))
+
+    angle = car.mast_angle
+    if angle is None or angle < 0:
+        return "mast limp (drawing nothing)"
+    if angle in (Car.MAST_UP, Car.MAST_DOWN):
+        return f"mast {angle} deg"
+    # Off-preset means it is being calibrated, so say what to keep.
+    return f"mast {angle} deg   (Car.MAST_UP is {Car.MAST_UP})"
+
 HELP = """
   w  forward        s  backward
 
@@ -47,6 +92,9 @@ HELP = """
 
   space  stop       x  quit
   r      unstick    i  show config and relay operation counts
+
+  t  mast up        g  mast down       v  mast limp
+  +/-  nudge the mast 5 deg, to dial in the raised angle
 
 Both arcs steer the same way — the inside track idles and the outside
 one pulls the nose round. They differ only in who ends them.
@@ -201,28 +249,11 @@ def main() -> int:
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     quitting = False
-    soft = SoftArc()
-    softing = None                       # (label, turn_right) while a soft arc is held
-    if soft.swallowed_by(getattr(car, "command_cooldown", 0.0)):
-        print(f"!! command_cooldown {car.command_cooldown:.2f}s exceeds the soft-arc "
-              f"pulse — q/e would drive straight. Lower it to use them.\n")
 
     try:
         tty.setcbreak(fd)
         while not quitting:
-            keys = read_keys().lower()
-
-            # No key this tick and a soft arc selected: keep its cycle
-            # turning. read_keys already blocks for its timeout, so
-            # this paces itself without a sleep.
-            if not keys and softing is not None:
-                try:
-                    car.drive(*soft.tracks(softing[1], time.monotonic()))
-                except BridgeError as e:
-                    print(f"\rerror: {e}")
-                continue
-
-            for key in keys:
+            for key in read_keys().lower():
                 if key == "x":
                     quitting = True
                     break
@@ -250,23 +281,17 @@ def main() -> int:
                     except BridgeError as e:
                         print(f"\rerror: {e}")
                     continue
-                if key in SOFT:
-                    label, turn_right = SOFT[key]
-                    softing = (label, turn_right)
-                    left, right = soft.tracks(turn_right, time.monotonic())
+                if key in MAST:
                     try:
-                        car.drive(left, right)
+                        print(f"\r{mast_key(car, MAST[key]):<44}", end="")
+                        sys.stdout.flush()
                     except BridgeError as e:
                         print(f"\rerror: {e}")
-                        continue
-                    print(f"\r{label:<16} cycling   ", end="")
-                    sys.stdout.flush()
                     continue
 
                 if key not in KEYS:
                     continue
 
-                softing = None            # any hard command ends the cycle
                 label, (left, right) = KEYS[key]
                 try:
                     reply = car.drive(left, right)
