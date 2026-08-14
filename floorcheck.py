@@ -48,6 +48,9 @@ def main() -> int:
     ap.add_argument("--image", default=None, help="replay a saved frame instead of capturing")
     ap.add_argument("--save", default=None, help="write the raw frame here (use .png)")
     ap.add_argument("--rotate", type=int, default=None, choices=(0, 180))
+    ap.add_argument("--port", default=None, help="ESP32 serial device")
+    ap.add_argument("--no-servo", action="store_true",
+                    help="do not open the bridge to raise the camera mast")
     args = ap.parse_args()
 
     if args.image:
@@ -59,9 +62,21 @@ def main() -> int:
     else:
         from record import CAMERA_ROTATION, Camera
         rot = CAMERA_ROTATION if args.rotate is None else args.rotate
-        cam = Camera(lock_exposure=True, rotate=rot)
+
+        # Only here to work the mast — nothing in this script drives.
+        mast = None
+        if not args.no_servo:
+            try:
+                from car import Car
+                mast = Car(port=args.port)
+            except Exception as e:
+                print(f"  !! no bridge, so no mast: {e}", file=sys.stderr)
+
+        cam = Camera(lock_exposure=True, rotate=rot, mast=mast)
         frame = cam.frame()
         cam.close()
+        if mast is not None:
+            mast.close()
 
     if args.save:
         # PNG, not JPEG. Chroma subsampling in a JPEG moves hue and

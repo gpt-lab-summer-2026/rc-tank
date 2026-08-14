@@ -379,6 +379,9 @@ def main() -> int:
     ap.add_argument("--turn-margin", type=float, default=0.05,
                     help="how much clearer one side must be, as a fraction")
     ap.add_argument("--threshold", type=int, default=40, help="floor match strictness 0-255")
+    ap.add_argument("--no-servo", action="store_true",
+                    help="do not raise the camera mast, and do not open the bridge "
+                         "just to raise it when dry running")
     ap.add_argument("--soft-margin", type=float, default=0.0,
                     help="how much clearer one side must be before drifting away "
                          "from the other while still going forward, as a fraction "
@@ -426,8 +429,6 @@ def main() -> int:
     # auto-exposure and auto-white-balance running means the camera
     # keeps changing those colours underneath it, and the model rots
     # over minutes for no reason that appears in any log.
-    cam = Camera(lock_exposure=not args.no_lock_exposure, rotate=args.rotate)
-
     # Tied to the tick rate rather than fixed: too short and a slow
     # frame drops the motors for no reason, too long and a loop that
     # has genuinely stopped keeps driving. Five ticks tolerates a
@@ -436,8 +437,19 @@ def main() -> int:
     if command_timeout is None:
         command_timeout = max(0.5, 5.0 / args.fps)
 
+    # The bridge opens BEFORE the camera now, which is the reverse of
+    # what it used to do. The mast servo hangs off the bridge, and the
+    # mast has to be up before the sensor spends two seconds settling
+    # its exposure on whatever it can see.
+    #
+    # It is also why --dry-run opens the bridge at all. Dry run means
+    # "decide but do not drive", not "do not touch the hardware": with
+    # the mast stowed there is nothing worth deciding about. No relay
+    # command is sent while dry running, so the firmware watchdog holds
+    # the motors released throughout — nothing refreshes them.
+    driving = not args.dry_run
     car = None
-    if not args.dry_run:
+    if driving or not args.no_servo:
         try:
             car = Car(port=args.port, command_timeout=command_timeout,
                       command_cooldown=args.cooldown)
@@ -446,9 +458,15 @@ def main() -> int:
             if warning:
                 print(f"\n  !! {warning}\n")
         except BridgeError as e:
-            cam.close()
-            print(f"could not open the bridge: {e}", file=sys.stderr)
-            return 1
+            if driving:
+                print(f"could not open the bridge: {e}", file=sys.stderr)
+                return 1
+            # Dry running is still worth doing without a mast, as long
+            # as it is clear the camera is wherever it was left.
+            print(f"  !! no bridge, so no mast: {e}", file=sys.stderr)
+
+    cam = Camera(lock_exposure=not args.no_lock_exposure, rotate=args.rotate,
+                 mast=None if args.no_servo else car)
 
     print("\nlearning the floor — keep a metre of clear ground ahead")
     time.sleep(1.0)
@@ -508,7 +526,7 @@ def main() -> int:
             # and a hung loop looks exactly like a healthy one holding
             # course — which, with nothing watching for a collision, is
             # the difference between stopping and driving into a wall.
-            if car is not None:
+            if car is not None and driving:
                 try:
                     car.drive(*decision)
                     last_error = None

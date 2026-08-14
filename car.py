@@ -566,6 +566,40 @@ class Car:
         """Yaws right while backing."""
         return self.drive(0, -1)
 
+    # ------------------------------------------------- camera mast
+
+    # Angles, not directions. The mast is at 0 stowed and 90 raised;
+    # anything else in 0-180 is reachable and unused.
+    MAST_DOWN = 0
+    MAST_UP = 90
+
+    def mast(self, angle: int) -> str:
+        """Point the camera mast servo. Negative lets it go limp.
+
+        Not rate-limited and not a relay operation — it goes straight
+        out rather than through _set, which exists to protect contacts
+        the servo does not have.
+        """
+        return self._send(f"V {int(angle)}")
+
+    def camera_up(self, settle: float = 0.6) -> str:
+        """Raise the mast and wait for it to actually get there.
+
+        The servo reports nothing back, so the wait is open-loop and
+        generous. Returning early would hand the camera to a caller
+        that then locks exposure on a view still swinging through
+        frame.
+        """
+        reply = self.mast(self.MAST_UP)
+        time.sleep(settle)
+        return reply
+
+    def camera_down(self, settle: float = 0.0) -> str:
+        reply = self.mast(self.MAST_DOWN)
+        if settle:
+            time.sleep(settle)
+        return reply
+
     def stop(self) -> str:
         # Never held. Whatever else is rate-limited, stopping is not.
         now = time.monotonic()

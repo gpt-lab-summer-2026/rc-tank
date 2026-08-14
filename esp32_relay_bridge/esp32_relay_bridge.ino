@@ -20,6 +20,10 @@
      ESP32 GPIO 32 -> buzzer +
      ESP32 GND     -> buzzer -
 
+     ESP32 GPIO 13 -> camera mast servo signal
+     servo V+      -> 5V        (see the current note below)
+     servo GND     -> common GND
+
      COM -> its own motor terminal
      NO  -> battery +    (all four)
      NC  -> battery -    (all four)
@@ -90,6 +94,7 @@
      C W <ms>      watchdog, 0 disables
      C A <0|1>     active low (1) or active high (0)
      C S <ms>      stagger between the two motors, 0 disables
+     V <angle>     camera mast servo, 0-180. Negative lets it go limp
 
    Replies:
 
@@ -102,6 +107,21 @@
 
      boot reason=<why>       printed once, when this chip starts
      evt watchdog-released   printed when the watchdog drops the relays
+
+   The servo is NOT touched by the watchdog. Losing the Pi releases
+   the motors because a moving tank with nobody driving is the
+   dangerous case; dropping the camera mast is merely untidy, and a
+   mast that slammed down every time the link hiccuped would wear out
+   faster than it would ever help. It also comes up detached after a
+   reset rather than driving to a default, so a brownout does not
+   lurch it.
+
+   A servo holding position against gravity draws current the whole
+   time it is held, from the same 5V rail the relay coils already sag.
+   If boot reason starts coming back BROWNOUT once the mast is up,
+   that is the new load, not a new fault: send V -1 to let it go limp
+   once the camera is where you want it, or give the servo its own
+   supply with a common ground.
 
    'boot' appearing mid-session means the bridge restarted under
    you. reason=BROWNOUT means the supply sagged, which on this
@@ -282,6 +302,55 @@ void targetsOff() {
   }
 }
 
+// The servo lives up here, above replyInfo() and handleLine(), because
+// both read servoAngle. The Arduino IDE hoists prototypes for
+// FUNCTIONS but not for variables, so a servoAngle declared further
+// down compiles as 'not declared in this scope' — the same trap that
+// put struct Note up with struct Pair.
+// ---------------------------- servo -----------------------------
+
+// Camera mast. 0 lowers it, 90 lifts it; the rest of the 0-180 range
+// is reachable but nothing here asks for it.
+const int PIN_SERVO   = 13;
+const int SERVO_CH    = 6;                // its own LEDC timer, not the buzzer's
+const int SERVO_MIN_US = 500;             // 0 degrees
+const int SERVO_MAX_US = 2400;            // 180 degrees
+
+// -1 means detached: no pulse train, so the horn is limp and drawing
+// nothing. That is the state at power-on, deliberately. Driving the
+// mast somewhere at boot would lurch it on every brownout reset, and
+// a servo told to hold a position holds it by pulling current from
+// the same 5V rail these relays already sag — see the wiring notes.
+int servoAngle = -1;
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  #define SERVO_ATTACH()  ledcAttach(PIN_SERVO, 50, 16)
+  #define SERVO_DUTY(d)   ledcWrite(PIN_SERVO, (d))
+  #define SERVO_DETACH()  ledcDetach(PIN_SERVO)
+#else
+  #define SERVO_ATTACH()  (ledcSetup(SERVO_CH, 50, 16), \
+                           ledcAttachPin(PIN_SERVO, SERVO_CH))
+  #define SERVO_DUTY(d)   ledcWrite(SERVO_CH, (d))
+  #define SERVO_DETACH()  ledcDetachPin(PIN_SERVO)
+#endif
+
+// Angle in, or negative to let go. 50 Hz means a 20000 us frame, so
+// the duty for a pulse is simply its share of that frame.
+void servoWrite(int angle) {
+  if (angle < 0) {
+    if (servoAngle >= 0) SERVO_DETACH();
+    servoAngle = -1;
+    return;
+  }
+  if (angle > 180) angle = 180;
+  if (servoAngle < 0) SERVO_ATTACH();
+
+  unsigned long us = SERVO_MIN_US +
+                     (unsigned long)(SERVO_MAX_US - SERVO_MIN_US) * angle / 180;
+  SERVO_DUTY((us * 65536UL) / 20000UL);
+  servoAngle = angle;
+}
+
 // ---------------------------- replies ----------------------------
 
 const char *resetReasonName(esp_reset_reason_t r) {
@@ -312,8 +381,8 @@ void replyOk() {
 void replyInfo() {
   Serial.printf(
     "info bridge=1 deadtime=%lu watchdog=%lu activelow=%d stagger=%lu "
-    "boot=%s up=%lu ops=%lu,%lu,%lu,%lu\n",
-    deadtimeMs, watchdogMs, activeLow ? 1 : 0, staggerMs,
+    "servo=%d boot=%s up=%lu ops=%lu,%lu,%lu,%lu\n",
+    deadtimeMs, watchdogMs, activeLow ? 1 : 0, staggerMs, servoAngle,
     resetReasonName(bootReason), millis(),
     relayOps[0], relayOps[1], relayOps[2], relayOps[3]);
 }
@@ -353,6 +422,17 @@ void handleLine(char *line) {
       tick(pairs[0]);                     // apply now if nothing pending
       tick(pairs[1]);
       replyOk();
+      return;
+    }
+
+    case 'V': case 'v': {
+      int a;
+      if (sscanf(line + 1, "%d", &a) != 1) {
+        Serial.println("err bad-args");
+        return;
+      }
+      servoWrite(a);
+      Serial.printf("ok servo=%d up=%lu\n", servoAngle, millis());
       return;
     }
 

@@ -124,7 +124,7 @@ class Camera:
     """
 
     def __init__(self, size=(640, 480), fps=30, lock_exposure=False,
-                 rotate=CAMERA_ROTATION):
+                 rotate=CAMERA_ROTATION, mast=None):
         try:
             from picamera2 import Picamera2
         except ImportError:
@@ -141,6 +141,27 @@ class Camera:
             )
         self.rotate = rotate
         self._rotate_in_software = False
+
+        # Raise the mast before anything looks through the lens. Doing
+        # it here rather than in each script means every program that
+        # constructs a Camera gets it, including ones written later
+        # that nobody remembers to wire up.
+        #
+        # It happens before the sensor starts, not after, because the
+        # 2 s AE/AWB settle below has to see the view the camera will
+        # actually keep. Lock exposure on a view still swinging up and
+        # the floor model learns a blur of wall and ceiling.
+        self._mast = mast
+        if self._mast is not None:
+            try:
+                self._mast.camera_up()
+                print("camera mast raised")
+            except Exception as e:
+                # A mast that will not lift is worth saying loudly, but
+                # it is not worth refusing to run over — the camera may
+                # still see enough, and the operator can look.
+                print(f"  !! camera mast did not raise: {e}", file=sys.stderr)
+                self._mast = None
 
         self.cam = Picamera2()
 
@@ -237,6 +258,11 @@ class Camera:
 
     def close(self):
         self.cam.stop()
+        if self._mast is not None:
+            try:
+                self._mast.camera_down()
+            except Exception:
+                pass          # shutting down; the bridge may already be gone
 
 
 # ------------------------------------------------------------ input
@@ -438,6 +464,8 @@ def main() -> int:
                          "(needs evdev; not used by default)")
     ap.add_argument("--no-car", action="store_true", help="do not drive, camera only")
     ap.add_argument("--lock-exposure", action="store_true", help="fix AE/AWB after warmup")
+    ap.add_argument("--no-servo", action="store_true",
+                    help="do not raise the camera mast")
     ap.add_argument("--rotate", type=int, default=CAMERA_ROTATION, choices=(0, 180),
                     help="turn each frame before it is saved "
                          f"(default {CAMERA_ROTATION}, this camera is mounted upside down)")
@@ -476,7 +504,8 @@ def main() -> int:
     # Camera bails with SystemExit when picamera2 is missing. Landing
     # in the shell with cbreak still set leaves it unusable.
     try:
-        cam = Camera(lock_exposure=args.lock_exposure, rotate=args.rotate)
+        cam = Camera(lock_exposure=args.lock_exposure, rotate=args.rotate,
+                     mast=None if args.no_servo else car)
     except BaseException:
         source.close()
         if car is not None:
