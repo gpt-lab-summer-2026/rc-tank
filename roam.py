@@ -81,7 +81,13 @@ class FloorModel:
     So the pair is chosen from the patch rather than fixed in advance.
     """
 
-    BINS = (24, 24)
+    # Default bin count per channel. Fewer bins is a coarser idea of
+    # what counts as the same colour, which is exactly what a floor
+    # with texture in it wants: at 24 bins a V axis spanning 0-256 is
+    # quantised every 10 levels, so grain 20 levels darker than the
+    # boards lands two bins away and reads as an obstacle. At 8 bins
+    # it is the same bin as the floor and disappears.
+    BINS = 24
 
     # channels into HSV, and the range of each, per mode.
     MODES = {
@@ -95,7 +101,9 @@ class FloorModel:
     # decision is not close in either direction.
     ACHROMATIC_S = 40
 
-    def __init__(self, smooth: float = 0.0, mode: str = "auto"):
+    def __init__(self, smooth: float = 0.0, mode: str = "auto",
+                 bins: int = BINS):
+        self.bins = (max(2, int(bins)), max(2, int(bins)))
         self.hist = None
         self.smooth = smooth      # 0 = learn once and never change
         self.mode = mode          # "auto" resolves on the first learn()
@@ -129,7 +137,7 @@ class FloorModel:
                         + ("has colour, using hue+saturation" if self.chosen == "hs"
                            else "effectively grey, hue is noise, using saturation+value"))
 
-        hist = cv2.calcHist([hsv], self.channels, None, self.BINS, self.ranges)
+        hist = cv2.calcHist([hsv], self.channels, None, self.bins, self.ranges)
         cv2.normalize(hist, hist, 0, 255, cv2.NORM_MINMAX)
 
         if self.hist is None or self.smooth <= 0:
@@ -173,6 +181,24 @@ class FloorModel:
         ko = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kc)
         return cv2.morphologyEx(m, cv2.MORPH_OPEN, ko)
+
+
+def shrink(bgr, scale: float):
+    """Downscale before anything looks at the frame.
+
+    INTER_AREA averages the pixels it discards rather than sampling
+    one of them, so floor texture is gone before the histogram is
+    built instead of being argued with afterwards. Everything
+    downstream — patch, mask, morphology, profile — then works on a
+    frame that never had the grain in it.
+
+    Clearances stay honest because --go and friends are fractions of
+    frame height. Kernel sizes do not: --close and --min-obstacle are
+    pixels, and shrink with the frame.
+    """
+    if scale >= 1.0:
+        return bgr
+    return cv2.resize(bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
 
 def free_profile(mask, min_obstacle: int = 1) -> np.ndarray:
@@ -219,7 +245,10 @@ def regions(profile: np.ndarray, pct: int = 25) -> tuple[float, float, float]:
     """Free height for left, centre and right thirds.
 
     A low percentile rather than the mean, so one thin chair leg
-    still counts as blocking that side.
+    still counts as blocking that side. That cuts both ways: at 25 a
+    quarter of the columns speckled with texture is enough to call a
+    third blocked. Raise it when the things being dodged are wide
+    enough to block most of a third on their own.
     """
     w = len(profile)
     third = w // 3
@@ -482,6 +511,20 @@ def main() -> int:
                     help="fill not-floor gaps thinner than this many pixels — wood "
                          "grain and grout, not obstacles. Raise until the floor "
                          "stops speckling; anything thinner is erased with it")
+    ap.add_argument("--scale", type=float, default=1.0,
+                    help="shrink each frame by this factor before looking at it. "
+                         "0.25 turns 640x480 into 160x120, which averages floor "
+                         "texture away before the histogram ever sees it and runs "
+                         "far faster. NOTE --close and --min-obstacle are in "
+                         "pixels, so they shrink with it")
+    ap.add_argument("--bins", type=int, default=FloorModel.BINS,
+                    help="histogram bins per channel. Fewer is a coarser idea of "
+                         "the same colour: 8 puts wood grain in the same bin as "
+                         "the boards, 24 puts it two bins away")
+    ap.add_argument("--percentile", type=int, default=25,
+                    help="how blocked a third must be to count as blocked. 25 "
+                         "means a quarter of its columns; raise it when obstacles "
+                         "are wide and texture is what is truncating columns")
     ap.add_argument("--channels", default="auto", choices=("auto", "hs", "sv"),
                     help="which two HSV channels model the floor. auto picks sv on a "
                          "grey floor, where hue is noise, and hs where there is colour")
@@ -555,8 +598,8 @@ def main() -> int:
 
     print("\nlearning the floor — keep a metre of clear ground ahead")
     time.sleep(1.0)
-    floor = FloorModel(smooth=args.adapt, mode=args.channels)
-    floor.learn(cam.frame())
+    floor = FloorModel(smooth=args.adapt, mode=args.channels, bins=args.bins)
+    floor.learn(shrink(cam.frame(), args.scale))
     print(f"learned: {getattr(floor, 'why', floor.chosen)}\n")
 
     # A cooldown longer than the arc pulse turns every pulse into a
@@ -573,7 +616,7 @@ def main() -> int:
             print(f"  soft arc on: ~{probe.ops_per_second:.1f} contact ops/sec "
                   f"while correcting\n")
 
-    frame = cam.frame()
+    frame = shrink(cam.frame(), args.scale)
     h = frame.shape[0]
     go_px = args.go * h
     margin_px = args.turn_margin * h
@@ -597,10 +640,10 @@ def main() -> int:
                 continue
             next_tick = max(now + period, next_tick + period)
 
-            frame = cam.frame()
+            frame = shrink(cam.frame(), args.scale)
             mask = floor.mask(frame, args.threshold, args.close)
             prof = free_profile(mask, args.min_obstacle)
-            regs = regions(prof)
+            regs = regions(prof, args.percentile)
 
             move = smoother.update(policy.decide(*regs, now), now)
             decision = tracks_for(move, now, soft)

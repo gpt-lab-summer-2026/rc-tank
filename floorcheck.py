@@ -43,6 +43,58 @@ def describe(name, hsv):
           f"V {v.mean():6.1f} +/-{v.std():5.1f}")
 
 
+def sweep(frame) -> int:
+    """What each coarseness knob does to THIS frame.
+
+    Clearances are printed as fractions of frame height so the rows
+    stay comparable across --scale, and so they can be read straight
+    against --go, which is the same units.
+    """
+    from roam import shrink
+
+    def run(scale=1.0, bins=FloorModel.BINS, close=11, minobs=1, pct=25, thresh=40):
+        im = shrink(frame, scale)
+        h = im.shape[0]
+        model = FloorModel(bins=bins)
+        model.learn(im)
+        m = model.mask(im, thresh, close)
+        prof = free_profile(m, minobs)
+        L, C, R = regions(prof, pct)
+        return L / h, C / h, R / h, (m > 0).mean() * 100, model.chosen
+
+    def row(label, **kw):
+        L, C, R, floor, mode = run(**kw)
+        flag = "  <- would drive" if C >= 0.45 else ""
+        print(f"  {label:<24} L{L:5.2f} C{C:5.2f} R{R:5.2f}   floor {floor:5.1f}%{flag}")
+
+    print("\nclearance as a fraction of frame height; --go default is 0.45\n")
+    print("  baseline")
+    row("as configured")
+    print("\n  --scale   (averages texture away before the histogram sees it)")
+    for v in (0.5, 0.33, 0.25):
+        row(f"scale {v}", scale=v)
+    print("\n  --bins    (coarser idea of the same colour)")
+    for v in (16, 12, 8, 6):
+        row(f"bins {v}", bins=v)
+    print("\n  --percentile  (how much of a third must be blocked)")
+    for v in (40, 50, 60):
+        row(f"percentile {v}", pct=v)
+    print("\n  --close   (fills gaps thinner than this)")
+    for v in (15, 21, 31):
+        row(f"close {v}", close=v)
+    print("\n  --min-obstacle  (ignore blockers shorter than this)")
+    for v in (10, 25, 40):
+        row(f"min-obstacle {v}", minobs=v)
+    print("\n  combined")
+    row("scale .33 bins 8", scale=0.33, bins=8)
+    row("scale .25 bins 8", scale=0.25, bins=8)
+    row("scale .25 bins 8 pct 50", scale=0.25, bins=8, pct=50)
+
+    print("\n  Pick the loosest row that still leaves a real obstacle showing.")
+    print("  Put a box or a bag in view and run this again to check that.\n")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", default=None, help="replay a saved frame instead of capturing")
@@ -51,6 +103,9 @@ def main() -> int:
     ap.add_argument("--port", default=None, help="ESP32 serial device")
     ap.add_argument("--no-servo", action="store_true",
                     help="do not open the bridge to raise the camera mast")
+    ap.add_argument("--sweep", action="store_true",
+                    help="try the coarseness knobs on this frame and print what "
+                         "each does, instead of the channel diagnosis")
     args = ap.parse_args()
 
     if args.image:
@@ -83,6 +138,9 @@ def main() -> int:
         # saturation around, which is exactly what is being measured.
         cv2.imwrite(args.save, frame)
         print(f"raw frame written to {args.save}")
+
+    if args.sweep:
+        return sweep(frame)
 
     h, w = frame.shape[:2]
     x0, y0, x1, y1 = FloorModel.patch_box(frame.shape)
