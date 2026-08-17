@@ -353,13 +353,7 @@ class Car:
                         continue          # that was not the reply, keep reading
                     break
                 self._last_tx = time.monotonic()
-            except OSError as e:
-                # OSError, not SerialException. SerialException subclasses
-                # it, but a bridge that browns out mid-command can drop
-                # the USB device and re-enumerate it, and the bare errno
-                # that surfaces from is not always wrapped. Catching only
-                # the wrapped kind let a brownout crash the caller
-                # instead of being reported as a link failure.
+            except serial.SerialException as e:
                 # pyserial raises this, not BridgeError, so without
                 # this every caller's `except BridgeError` misses an
                 # unplugged cable entirely.
@@ -674,46 +668,6 @@ class Car:
         except Exception:
             pass
 
-    def mast_sweep(self, angle: int, step: int = 8,
-                   delay: float = 0.035) -> str:
-        """Walk the mast to an angle instead of jumping to it.
-
-        A servo told to go somewhere far drives at full torque to get
-        there, and full torque is full current. Told to go eight
-        degrees it barely draws anything. Same destination, a fraction
-        of the peak.
-
-        That peak is the whole problem here. The servo shares its 5V
-        with the relay coils and the ESP32, so a full-travel command
-        sags the rail far enough to reset the bridge — relays clicking,
-        boot tune playing, mid-session, which is what pressing t or g
-        was doing. Stepping is the only mitigation available in
-        software. It is not a substitute for the hardware fix; see the
-        supply notes in the firmware header.
-        """
-        target = int(angle)
-        if target < 0:
-            return self.mast(target)          # releasing draws nothing
-
-        here = self.mast_angle
-        if here is None or here < 0:
-            # Never commanded, or released and resting. An unheld mast
-            # falls to its stop, so down is where it actually is after
-            # a boot or a stow — and starting the ramp from there keeps
-            # the first step small, which is exactly when the surge
-            # used to happen.
-            here = self.MAST_DOWN
-
-        step = max(1, abs(int(step)))
-        reply = ""
-        while here != target:
-            here = (min(here + step, target) if target > here
-                    else max(here - step, target))
-            reply = self.mast(here)
-            if here != target:
-                time.sleep(delay)
-        return reply or self.mast(target)
-
     def camera_up(self, settle: float = 0.6) -> str:
         """Raise the mast and wait for it to actually get there.
 
@@ -722,7 +676,7 @@ class Car:
         that then locks exposure on a view still swinging through
         frame.
         """
-        reply = self.mast_sweep(self.MAST_UP)
+        reply = self.mast(self.MAST_UP)
         time.sleep(settle)
         return reply
 
@@ -748,7 +702,7 @@ class Car:
         down before letting go; releasing early would drop it the rest
         of the way.
         """
-        reply = self.mast_sweep(self.MAST_DOWN)
+        reply = self.mast(self.MAST_DOWN)
         if settle:
             time.sleep(settle)
         if release:
