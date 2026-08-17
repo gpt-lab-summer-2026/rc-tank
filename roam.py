@@ -279,7 +279,7 @@ class Policy:
 
     def __init__(self, go: float, turn_margin: float, stuck_after: float,
                  reverse_for: float, soft_margin: float = 0.0,
-                 back_below: float = 0.35):
+                 back_below: float = 0.35, dodge_min: float = 0.5):
         self.go = go                      # centre clearance to keep going
         self.turn_margin = turn_margin    # how much better a side must be
         self.stuck_after = stuck_after
@@ -290,19 +290,46 @@ class Policy:
         # Below this fraction of go, a forward arc would drive into
         # whatever is ahead, so turn while backing instead.
         self.back_below = back_below
+        # How much room a side needs, as a fraction of go, before it
+        # counts as somewhere to dodge INTO rather than just the less
+        # bad wall. This is the whole difference between the two cases:
+        # above it there is a way past, below it there is not.
+        self.dodge_min = dodge_min
         self._turning_since = None
         self._reverse_until = None
+        self._escape_move = None
+
+    def _escape(self, left_is_better: bool, now) -> str:
+        """Back out of somewhere with no way through, turning as it goes.
+
+        The heading is chosen once, here, and held for the whole
+        retreat. Re-deciding it every frame is what a straight reverse
+        effectively did: the camera is pointing the wrong way, so the
+        numbers it is re-deciding from are about ground already behind
+        the tank, and the left/right call flickers on noise. Averaged
+        over a second that is no turn at all — reversing in a line,
+        arriving with the same view, and doing it again.
+
+        Committing means the nose is genuinely somewhere else when the
+        retreat ends, which is the only thing that stops the loop.
+        """
+        self._escape_move = ("soft_back_left" if left_is_better
+                             else "soft_back_right")
+        self._reverse_until = now + self.reverse_for
+        self._turning_since = None
+        return self._escape_move
 
     def decide(self, left, centre, right, now) -> str:
-        # A reverse runs for a fixed time and then hands back to the
-        # normal rules. Backing up until the view ahead clears reads
-        # as the sensible version and is not: the camera faces the
-        # other way, so the longer it runs the less anything knows
-        # about where the car is going.
+        # A retreat runs for a fixed time on the heading it picked, then
+        # hands back to the normal rules. Backing until the view ahead
+        # clears reads as the sensible version and is not: the camera
+        # faces the other way, so the longer it runs the less anything
+        # knows about where the tank is going.
         if self._reverse_until is not None:
             if now < self._reverse_until:
-                return "reverse"
+                return self._escape_move
             self._reverse_until = None
+            self._escape_move = None
             self._turning_since = None    # turning gets a fresh chance
 
         if centre >= self.go:
@@ -319,16 +346,32 @@ class Policy:
                     return "soft_arc_right"
             return "forward"
 
+        # Blocked ahead. The question is now which of two situations
+        # this is, and they want opposite things:
+        #
+        #   somewhere to go   -> dodge, keep the ground already made
+        #   nowhere to go     -> give the ground up and turn while
+        #                        doing it, so the next look is at
+        #                        something different
+        #
+        # Ties and near-ties break left so the tank does not dither.
+        left_is_better = not (right > left + self.turn_margin)
+
+        # Nowhere to go: neither side has enough room to be a way past,
+        # so this is a corner or a wall rather than an obstacle with a
+        # gap beside it. Straight back would return to this same spot
+        # facing the same way.
+        if max(left, right) < self.go * self.dodge_min:
+            return self._escape(left_is_better, now)
+
+        # There is room on one side, so try for it. If that has not
+        # worked for stuck_after seconds it was not the way past it
+        # looked like — usually something the floor model cannot see
+        # properly — and the retreat is the fallback.
         if self._turning_since is None:
             self._turning_since = now
         elif now - self._turning_since > self.stuck_after:
-            # Turning has not found a way out. Straight back instead.
-            self._reverse_until = now + self.reverse_for
-            return "reverse"
-
-        # Blocked ahead: turn toward the side with more room. Ties and
-        # near-ties break left so the car does not dither in a corner.
-        left_is_better = not (right > left + self.turn_margin)
+            return self._escape(left_is_better, now)
 
         # Almost nothing ahead. A forward arc here would turn while
         # driving into the thing being turned away from, so give up the
@@ -422,6 +465,11 @@ def main() -> int:
                          "costs contact life faster")
     ap.add_argument("--soft-duty", type=float, default=0.30,
                     help="fraction of each soft-arc cycle spent arcing")
+    ap.add_argument("--dodge-min", type=float, default=0.5,
+                    help="room a side needs, as a fraction of --go, before it "
+                         "counts as a way past rather than the less bad wall. "
+                         "Below it on both sides, roam backs out and turns "
+                         "instead of trying to squeeze through")
     ap.add_argument("--back-below", type=float, default=0.35,
                     help="turn while REVERSING when centre clearance falls below "
                          "this fraction of --go, instead of arcing forward into it")
@@ -531,7 +579,8 @@ def main() -> int:
     margin_px = args.turn_margin * h
 
     policy = Policy(go_px, margin_px, args.stuck_after, args.reverse_for,
-                    soft_margin=args.soft_margin * h, back_below=args.back_below)
+                    soft_margin=args.soft_margin * h, back_below=args.back_below,
+                    dodge_min=args.dodge_min)
     soft = SoftArc(period=args.soft_period, duty=args.soft_duty)
     smoother = Smoother(args.window, args.min_interval)
 
