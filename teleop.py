@@ -294,11 +294,19 @@ def main() -> int:
                         print(f"\rerror: {e}")
                     continue
                 if key in MAST:
+                    # Broad on purpose. Moving the mast is the one thing
+                    # here that can brown out the bridge, and a reset
+                    # mid-command surfaces as whatever the OS felt like
+                    # raising. Losing the tank because the camera moved
+                    # is not a trade worth making.
                     try:
                         print(f"\r{mast_key(car, MAST[key]):<44}", end="")
                         sys.stdout.flush()
-                    except BridgeError as e:
-                        print(f"\rerror: {e}")
+                    except Exception as e:
+                        print(f"\rmast failed: {e}")
+                        print("   if the relays clicked and the tune played, the "
+                              "bridge reset —\n   that is the servo pulling the 5V "
+                              "rail down, not a serial fault.")
                     continue
 
                 if key not in KEYS:

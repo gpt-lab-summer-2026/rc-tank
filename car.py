@@ -353,7 +353,13 @@ class Car:
                         continue          # that was not the reply, keep reading
                     break
                 self._last_tx = time.monotonic()
-            except serial.SerialException as e:
+            except OSError as e:
+                # OSError, not SerialException. SerialException subclasses
+                # it, but a bridge that browns out mid-command can drop
+                # the USB device and re-enumerate it, and the bare errno
+                # that surfaces from is not always wrapped. Catching only
+                # the wrapped kind let a brownout crash the caller
+                # instead of being reported as a link failure.
                 # pyserial raises this, not BridgeError, so without
                 # this every caller's `except BridgeError` misses an
                 # unplugged cable entirely.
@@ -660,9 +666,53 @@ class Car:
         try:
             if (self._ser is not None and self.mast_angle is not None
                     and self.mast_angle > self.MAST_DOWN):
-                self.mast(self.MAST_DOWN)
+                # Full lowering, including the release. Sending a bare
+                # MAST_DOWN here would leave the servo stalled against
+                # its stop for as long as the bridge stays powered,
+                # which is exactly the failure this path used to cause.
+                self.camera_down()
         except Exception:
             pass
+
+    def mast_sweep(self, angle: int, step: int = 8,
+                   delay: float = 0.035) -> str:
+        """Walk the mast to an angle instead of jumping to it.
+
+        A servo told to go somewhere far drives at full torque to get
+        there, and full torque is full current. Told to go eight
+        degrees it barely draws anything. Same destination, a fraction
+        of the peak.
+
+        That peak is the whole problem here. The servo shares its 5V
+        with the relay coils and the ESP32, so a full-travel command
+        sags the rail far enough to reset the bridge — relays clicking,
+        boot tune playing, mid-session, which is what pressing t or g
+        was doing. Stepping is the only mitigation available in
+        software. It is not a substitute for the hardware fix; see the
+        supply notes in the firmware header.
+        """
+        target = int(angle)
+        if target < 0:
+            return self.mast(target)          # releasing draws nothing
+
+        here = self.mast_angle
+        if here is None or here < 0:
+            # Never commanded, or released and resting. An unheld mast
+            # falls to its stop, so down is where it actually is after
+            # a boot or a stow — and starting the ramp from there keeps
+            # the first step small, which is exactly when the surge
+            # used to happen.
+            here = self.MAST_DOWN
+
+        step = max(1, abs(int(step)))
+        reply = ""
+        while here != target:
+            here = (min(here + step, target) if target > here
+                    else max(here - step, target))
+            reply = self.mast(here)
+            if here != target:
+                time.sleep(delay)
+        return reply or self.mast(target)
 
     def camera_up(self, settle: float = 0.6) -> str:
         """Raise the mast and wait for it to actually get there.
@@ -672,14 +722,37 @@ class Car:
         that then locks exposure on a view still swinging through
         frame.
         """
-        reply = self.mast(self.MAST_UP)
+        reply = self.mast_sweep(self.MAST_UP)
         time.sleep(settle)
         return reply
 
-    def camera_down(self, settle: float = 0.0) -> str:
-        reply = self.mast(self.MAST_DOWN)
+    def camera_down(self, settle: float = 0.6, release: bool = True) -> str:
+        """Lower the mast, then STOP DRIVING IT.
+
+        The release is the whole point, not a tidy-up. A servo holds a
+        position by continuously fighting for it, and at the bottom of
+        the travel it is fighting the mechanical stop as well — which
+        is a stall. A stalled servo buzzes, hunts, and pulls its worst
+        current from the same 5V rail the relay coils already sag.
+
+        Nothing here ever told it to stop. The pulse train is generated
+        on the ESP32, so closing the serial port does not end it: the
+        mast was left driving into its stop indefinitely, long after
+        the program that asked for it had exited. That is the
+        aggressive vibration on Ctrl+C, and it appeared the moment
+        lowering started working at all — before that the mast simply
+        stayed up and never had anything to fight.
+
+        Resting on a stop needs no torque, so once it has arrived there
+        is nothing to hold. settle is how long to allow for the trip
+        down before letting go; releasing early would drop it the rest
+        of the way.
+        """
+        reply = self.mast_sweep(self.MAST_DOWN)
         if settle:
             time.sleep(settle)
+        if release:
+            reply = self.mast(-1)
         return reply
 
     def stop(self) -> str:

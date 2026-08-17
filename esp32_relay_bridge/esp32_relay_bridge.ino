@@ -339,7 +339,15 @@ int servoAngle = -1;
 // the duty for a pulse is simply its share of that frame.
 void servoWrite(int angle) {
   if (angle < 0) {
-    if (servoAngle >= 0) SERVO_DETACH();
+    if (servoAngle >= 0) {
+      SERVO_DETACH();
+      // Detaching stops LEDC driving the pin but leaves it wherever
+      // the peripheral let go. A servo signal line that floats picks
+      // up whatever is on the harness and can twitch on it, so park it
+      // definitively low: no edges, no pulses, nothing to decode.
+      pinMode(PIN_SERVO, OUTPUT);
+      digitalWrite(PIN_SERVO, LOW);
+    }
     servoAngle = -1;
     return;
   }
@@ -374,7 +382,7 @@ const int BUZZER_CH  = 4;                 // LEDC channel, nothing else uses it
 #endif
 
 // Rising: the bridge came up when you asked it to.
-const Note STARTUP[] = {{784, 90}, {988, 90}, {784, 160}};   // G5 B5 E6
+const Note STARTUP[] = {{784, 90}, {988, 90}, {220, 160}};   // G5 B5 E6
 
 // Falling: it came up when you  did NOT ask it to. Same three notes
 // backwards, which is enough to tell apart from across a room.
