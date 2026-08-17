@@ -1,0 +1,1 @@
+python roam.py --debug-image /tmp/roam.jpg --threshold 10 --min-obstacle 45 --close 20
