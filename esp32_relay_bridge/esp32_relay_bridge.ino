@@ -95,6 +95,7 @@
      C A <0|1>     active low (1) or active high (0)
      C S <ms>      stagger between the two motors, 0 disables
      V <angle>     camera mast servo, 0-180. Negative lets it go limp
+     T <n>         play tune n (0 teleop, 1 roam, 2 record)
 
    Replies:
 
@@ -351,6 +352,109 @@ void servoWrite(int angle) {
   servoAngle = angle;
 }
 
+// ---------------------------- buzzer ----------------------------
+
+// See the BUZZER note in the header before moving this to 34/35/36/39.
+const int PIN_BUZZER = 32;
+const int BUZZER_CH  = 4;                 // LEDC channel, nothing else uses it
+
+// struct Note is declared up with struct Pair, not here. See the note
+// there for why moving it back down breaks the build.
+
+// The LEDC API was rewritten in Arduino-ESP32 3.0: channels became
+// implicit and the calls take the pin. Both spellings are kept so
+// this compiles whichever core is installed.
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  #define BUZZER_BEGIN()  ledcAttach(PIN_BUZZER, 2000, 10)
+  #define BUZZER_TONE(f)  ledcWriteTone(PIN_BUZZER, (f))
+#else
+  #define BUZZER_BEGIN()  (ledcSetup(BUZZER_CH, 2000, 10), \
+                           ledcAttachPin(PIN_BUZZER, BUZZER_CH))
+  #define BUZZER_TONE(f)  ledcWriteTone(BUZZER_CH, (f))
+#endif
+
+// Rising: the bridge came up when you asked it to.
+const Note STARTUP[] = {{784, 90}, {988, 90}, {784, 160}};   // G5 B5 E6
+
+// Falling: it came up when you  did NOT ask it to. Same three notes
+// backwards, which is enough to tell apart from across a room.
+//
+// This is the cheap half of a diagnostic the firmware already cares
+// about — a restart mid-drive means the motors took the rail down,
+// and until now the only way to notice was watching the terminal.
+// Delete RESTART and the branch in setup() if you would rather every
+// boot sounded the same.
+const Note RESTART[] = {{1319, 90}, {988, 90}, {784, 160}};
+
+#define TUNE(t) playTune((t), sizeof(t) / sizeof((t)[0]))
+
+void playTune(const Note *notes, int count) {
+  for (int i = 0; i < count; i++) {
+    BUZZER_TONE(notes[i].hz);
+    delay(notes[i].ms);
+  }
+  BUZZER_TONE(0);                         // do not leave the pin driven
+}
+
+// The restarts that are routine. Opening the serial port resets the
+// board, so these three are expected at the start of every run —
+// car.py's _NORMAL_BOOT holds the same list for the same reason.
+bool bootExpected(esp_reset_reason_t r) {
+  return r == ESP_RST_POWERON || r == ESP_RST_EXT || r == ESP_RST_SW;
+}
+
+// One short major-key run per program, played when that program
+// connects. Different enough to tell apart from the next room, which
+// is the point: you learn which thing started without looking at the
+// terminal, and a tune you did not expect means something restarted.
+//
+// All under 400 ms. This plays while the tank is live, and every note
+// is time the operator spends waiting to drive.
+const Note TUNE_TELEOP[] = {{523, 90}, {659, 90}, {784, 150}};
+const Note TUNE_ROAM[]   = {{659, 80}, {784, 80}, {988, 80}, {1319, 160}};
+const Note TUNE_RECORD[] = {{784, 90}, {1047, 90}, {784, 90}, {1319, 160}};
+
+struct Tune { const Note *notes; int count; };
+const Tune TUNES[] = {
+  {TUNE_TELEOP, 3},
+  {TUNE_ROAM,   4},
+  {TUNE_RECORD, 4},
+};
+const int TUNE_COUNT = sizeof(TUNES) / sizeof(TUNES[0]);
+
+// Non-blocking, unlike playTune above, and for a specific reason.
+// The boot tune can afford to block: nothing is driving yet. A tune
+// asked for over the wire cannot, because blocking loop() would stop
+// tick() servicing a dead-time pause and stop the watchdog noticing a
+// dead Pi. A buzzer should not be able to do either of those, so this
+// one is a state machine that loop() steps through.
+const Note *tuneNotes = nullptr;
+int tuneCount = 0, tuneAt = 0;
+unsigned long tuneUntil = 0;
+
+void startTune(const Note *notes, int count) {
+  tuneNotes = notes;
+  tuneCount = count;
+  tuneAt = -1;                    // first service() advances to note 0
+  tuneUntil = 0;
+}
+
+void serviceTune() {
+  if (tuneNotes == nullptr) return;
+
+  unsigned long now = millis();
+  if (tuneAt >= 0 && now < tuneUntil) return;
+
+  tuneAt++;
+  if (tuneAt >= tuneCount) {
+    BUZZER_TONE(0);               // do not leave the pin driven
+    tuneNotes = nullptr;
+    return;
+  }
+  BUZZER_TONE(tuneNotes[tuneAt].hz);
+  tuneUntil = now + tuneNotes[tuneAt].ms;
+}
+
 // ---------------------------- replies ----------------------------
 
 const char *resetReasonName(esp_reset_reason_t r) {
@@ -436,6 +540,21 @@ void handleLine(char *line) {
       return;
     }
 
+    case 'T': case 't': {
+      int n;
+      if (sscanf(line + 1, "%d", &n) != 1) {
+        Serial.println("err bad-args");
+        return;
+      }
+      if (n < 0 || n >= TUNE_COUNT) {
+        Serial.println("err bad-tune");
+        return;
+      }
+      startTune(TUNES[n].notes, TUNES[n].count);
+      Serial.printf("ok tune=%d up=%lu\n", n, millis());
+      return;
+    }
+
     case 'P': case 'p':
       replyOk();
       return;
@@ -496,57 +615,6 @@ void readSerial() {
   }
 }
 
-// ---------------------------- buzzer ----------------------------
-
-// See the BUZZER note in the header before moving this to 34/35/36/39.
-const int PIN_BUZZER = 32;
-const int BUZZER_CH  = 4;                 // LEDC channel, nothing else uses it
-
-// struct Note is declared up with struct Pair, not here. See the note
-// there for why moving it back down breaks the build.
-
-// The LEDC API was rewritten in Arduino-ESP32 3.0: channels became
-// implicit and the calls take the pin. Both spellings are kept so
-// this compiles whichever core is installed.
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
-  #define BUZZER_BEGIN()  ledcAttach(PIN_BUZZER, 2000, 10)
-  #define BUZZER_TONE(f)  ledcWriteTone(PIN_BUZZER, (f))
-#else
-  #define BUZZER_BEGIN()  (ledcSetup(BUZZER_CH, 2000, 10), \
-                           ledcAttachPin(PIN_BUZZER, BUZZER_CH))
-  #define BUZZER_TONE(f)  ledcWriteTone(BUZZER_CH, (f))
-#endif
-
-// Rising: the bridge came up when you asked it to.
-const Note STARTUP[] = {{784, 90}, {988, 90}, {784, 160}};   // G5 B5 E6
-
-// Falling: it came up when you  did NOT ask it to. Same three notes
-// backwards, which is enough to tell apart from across a room.
-//
-// This is the cheap half of a diagnostic the firmware already cares
-// about — a restart mid-drive means the motors took the rail down,
-// and until now the only way to notice was watching the terminal.
-// Delete RESTART and the branch in setup() if you would rather every
-// boot sounded the same.
-const Note RESTART[] = {{1319, 90}, {988, 90}, {784, 160}};
-
-#define TUNE(t) playTune((t), sizeof(t) / sizeof((t)[0]))
-
-void playTune(const Note *notes, int count) {
-  for (int i = 0; i < count; i++) {
-    BUZZER_TONE(notes[i].hz);
-    delay(notes[i].ms);
-  }
-  BUZZER_TONE(0);                         // do not leave the pin driven
-}
-
-// The restarts that are routine. Opening the serial port resets the
-// board, so these three are expected at the start of every run —
-// car.py's _NORMAL_BOOT holds the same list for the same reason.
-bool bootExpected(esp_reset_reason_t r) {
-  return r == ESP_RST_POWERON || r == ESP_RST_EXT || r == ESP_RST_SW;
-}
-
 // ----------------------------- main -----------------------------
 
 void setup() {
@@ -596,6 +664,8 @@ void loop() {
     }
     targetsOff();
   }
+
+  serviceTune();
 
   tick(pairs[0]);
   tick(pairs[1]);

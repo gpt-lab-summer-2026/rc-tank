@@ -148,11 +148,25 @@ class SoftArc:
         self.period = period
         self.duty = duty
 
-    def tracks(self, turn_right: bool, now: float) -> tuple[int, int]:
-        """The track pair for this instant of the cycle."""
+    def tracks(self, turn_right: bool, now: float,
+               reverse: bool = False) -> tuple[int, int]:
+        """The track pair for this instant of the cycle.
+
+        reverse runs the same cycle backwards: both tracks reversing
+        between pulses instead of both driving. That is the only way
+        this chassis turns while backing — holding ONE track in
+        reverse against a stopped one barely turns it at all, whereas
+        interrupting a reverse both tracks are already committed to
+        carries enough momentum through the pulse to swing the nose.
+
+        Note the sides invert. Going forward the inside track idles;
+        going backwards the OTHER one does, because the nose swings
+        the opposite way when the tracks pull the opposite way.
+        """
+        base = -1 if reverse else 1
         if (now % self.period) < self.period * self.duty:
-            return (1, 0) if turn_right else (0, 1)     # the arc pulse
-        return (1, 1)                                   # and cruise between
+            return (base, 0) if turn_right != reverse else (0, base)
+        return (base, base)
 
     @property
     def ops_per_second(self) -> float:
@@ -498,7 +512,8 @@ class Car:
         """
         return self._drive(left, right)
 
-    def soft_arc(self, side: str, seconds: float = 1.0) -> bool:
+    def soft_arc(self, side: str, seconds: float = 1.0,
+                 reverse: bool = False) -> bool:
         """Steer by dropping one track briefly, then put it back.
 
         Cutting the inside track lets the outside one pull the nose
@@ -515,8 +530,15 @@ class Car:
             raise ValueError("side must be 'left' or 'right'")
 
         before = self._last_state
-        # Inside track idles, outside track drives.
-        self.drive(0, 1) if side == "left" else self.drive(1, 0)
+
+        # Idle the track that must travel less. Forward that is the
+        # inside one; backing it is the other, since the nose swings
+        # the other way when the tracks pull the other way.
+        base = -1 if reverse else 1
+        if (side == "right") != reverse:
+            self.drive(base, 0)
+        else:
+            self.drive(0, base)
         if self.last_command_held:
             return False
 
@@ -552,22 +574,14 @@ class Car:
         """Yaws right, travelling forward."""
         return self.drive(1, 0)
 
-    # The reverse arcs yaw the same way as their forward namesakes but
-    # retreat instead of advancing, which is what makes them the turn
-    # to use when the thing you are turning away from is in front.
+    # There is deliberately no held back_arc_left/right. Driving one
+    # track in reverse against a stopped one barely turns this chassis
+    # — it digs in rather than pivoting — so a reverse turn is a soft
+    # arc instead: both tracks reversing, briefly interrupted. See
+    # SoftArc.tracks(reverse=True) and soft_arc(reverse=True).
     #
-    # NOTE the naming. record.py's LABELS calls (-1, 0) "rev_arc_right"
-    # because a driver reversing with the stick right sees the REAR
-    # swing right. The nose goes left. Both names describe the same
-    # motion from different seats; these two are named for the nose,
-    # because roam.py steers by where it wants to end up pointing.
-    def back_arc_left(self) -> str:
-        """Yaws left while backing. One track, no forward travel."""
-        return self.drive(-1, 0)
-
-    def back_arc_right(self) -> str:
-        """Yaws right while backing."""
-        return self.drive(0, -1)
+    # The single-track reverse states still exist as relay states and
+    # drive(-1, 0) will still produce one. Nothing here asks for one.
 
     # ------------------------------------------------- camera mast
 
@@ -575,6 +589,40 @@ class Car:
     # anything else in 0-180 is reachable and unused.
     MAST_DOWN = 0
     MAST_UP = 125
+
+    # ------------------------------------------------------- buzzer
+
+    # Tune indices, matching the TUNES table in the firmware. Keep the
+    # two in step: the bridge validates the range but cannot tell a
+    # wrong-but-valid index from a right one, so a mismatch here plays
+    # the wrong program's tune rather than reporting anything.
+    TUNE_TELEOP = 0
+    TUNE_ROAM = 1
+    TUNE_RECORD = 2
+
+    def tune(self, n: int) -> str:
+        """Play one of the firmware's tunes. Returns as it starts.
+
+        The bridge plays it from its main loop rather than blocking in
+        one, so this does not stall relay timing and does not hold the
+        caller up either — by the time the reply lands the first note
+        is sounding and the rest are the bridge's problem.
+        """
+        return self._send(f"T {int(n)}")
+
+    def chirp(self, n: int) -> None:
+        """tune(), for callers who would rather not be interrupted.
+
+        A startup jingle is decoration. Nothing about a program that
+        wants to drive should fail because a buzzer did not, so this
+        swallows what tune() would raise.
+        """
+        try:
+            self.tune(n)
+        except Exception:
+            pass
+
+    # ------------------------------------------------- camera mast
 
     def mast(self, angle: int) -> str:
         """Point the camera mast servo. Negative lets it go limp.

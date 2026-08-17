@@ -39,6 +39,13 @@ KEYS = {
 # key -> side.  Timed nudges, not states — see Car.soft_arc.
 ARCS = {"a": "left", "d": "right"}
 
+# The same nudge with both tracks backing instead of driving. There is
+# no held reverse arc to pair with q/e, because idling one track while
+# the other backs digs this chassis in rather than turning it. The
+# pulse works where the hold does not: both tracks are already moving,
+# so the interruption swings the nose instead of stalling it.
+BACK_ARCS = {"z": "left", "c": "right"}
+
 # Camera mast. t and g are the two presets; the nudges exist so the
 # raised angle can be dialled in against the real linkage without
 # editing car.py and restarting, which is otherwise a reflash-speed
@@ -89,6 +96,7 @@ HELP = """
 
   q  arc left       e  arc right      held until you press something else
   a  soft arc left  d  soft arc right --arc-time seconds, then back
+  z  back arc left  c  back arc right same, both tracks reversing
 
   space  stop       x  quit
   r      unstick    i  show config and relay operation counts
@@ -234,6 +242,8 @@ def main() -> int:
     print(f"connected on {car.port}")
     print(car.info())
 
+    car.chirp(Car.TUNE_TELEOP)
+
     warning = boot_warning(car.boot_reason)
     if warning:
         print(f"\n  !! {warning}\n")
@@ -269,12 +279,14 @@ def main() -> int:
                     except BridgeError as e:
                         print(f"\rerror: {e}")
                     continue
-                if key in ARCS:
-                    side = ARCS[key]
-                    print(f"\rsoft arc {side:<6} inside track idling ...", end="")
+                if key in ARCS or key in BACK_ARCS:
+                    back = key in BACK_ARCS
+                    side = BACK_ARCS[key] if back else ARCS[key]
+                    what = "back arc" if back else "soft arc"
+                    print(f"\r{what} {side:<6} one track idling ...", end="")
                     sys.stdout.flush()
                     try:
-                        if car.soft_arc(side, args.arc_time):
+                        if car.soft_arc(side, args.arc_time, reverse=back):
                             print(" back on course      ")
                         else:
                             print(f" HELD {car.cooldown_remaining():.1f}s      ")

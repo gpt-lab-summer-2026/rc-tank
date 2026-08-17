@@ -236,26 +236,27 @@ def regions(profile: np.ndarray, pct: int = 25) -> tuple[float, float, float]:
 # Track pair for each move that is a single held state. Soft arcs are
 # not in here — they are not one state, see SoftArc.
 #
-# Yaw, for the two that are easy to get backwards: (-1, 0) runs the
-# left track back against a stopped right one, which swings the NOSE
-# left while the tank retreats. record.py's LABELS calls that same
-# pair "rev_arc_right", naming it for where a reversing driver sees
-# the tail go. Same motion, two seats.
+# There are no single-track reverse states here. Backing one track
+# against a stopped one digs this chassis in instead of pivoting it,
+# so a reverse turn is soft_back_left / soft_back_right: both tracks
+# reversing, briefly interrupted to swing the nose. Those are not in
+# this table because they are not one state — see tracks_for().
 TRACKS = {
     "forward":       (1, 1),
     "reverse":       (-1, -1),
     "stop":          (0, 0),
     "arc_left":      (0, 1),
     "arc_right":     (1, 0),
-    "back_arc_left": (-1, 0),
-    "back_arc_right": (0, -1),
 }
 
 
 def tracks_for(move: str, now: float, soft: SoftArc) -> tuple[int, int]:
     """Resolve a move name to the pair of track directions for now."""
     if move.startswith("soft_"):
-        return soft.tracks(move.endswith("right"), now)
+        # soft_back_* run the cycle in reverse: both tracks backing
+        # between pulses rather than both driving.
+        return soft.tracks(move.endswith("right"), now,
+                           reverse="back" in move)
     return TRACKS[move]
 
 
@@ -332,8 +333,12 @@ class Policy:
         # Almost nothing ahead. A forward arc here would turn while
         # driving into the thing being turned away from, so give up the
         # ground instead and yaw the same way going backwards.
+        #
+        # Soft, not a held single-track reverse: both tracks back out
+        # together and the turn comes from interrupting one of them.
+        # Held, this chassis barely turns backwards at all.
         if centre < self.go * self.back_below:
-            return "back_arc_left" if left_is_better else "back_arc_right"
+            return "soft_back_left" if left_is_better else "soft_back_right"
 
         return "arc_left" if left_is_better else "arc_right"
 
@@ -485,6 +490,7 @@ def main() -> int:
             car = Car(port=args.port, command_timeout=command_timeout,
                       command_cooldown=args.cooldown)
             print(f"bridge on {car.port}  (releases after {command_timeout:.1f}s silent)")
+            car.chirp(Car.TUNE_ROAM)
             warning = boot_warning(car.boot_reason)
             if warning:
                 print(f"\n  !! {warning}\n")

@@ -85,8 +85,15 @@ def mix(steer: float, throttle: float, dz: float) -> tuple[int, int]:
     base = 1 if throttle > dz else (-1 if throttle < -dz else 0)
     turn = 1 if steer > dz else (-1 if steer < -dz else 0)
 
-    if base and turn:                       # arc: inner track stops
+    if base > 0 and turn:                   # arc: inner track stops
         return (base, 0) if turn > 0 else (0, base)
+    if base < 0 and turn:
+        # Steering while backing used to idle one track, which on this
+        # chassis digs in rather than turning. A stick cannot express
+        # the pulsed alternative — that is a thing done over time, not
+        # a state — so backing goes straight and the turn waits until
+        # the tank is going forward again.
+        return (base, base)
     if turn:
         # Steering with no throttle. This used to spin the tracks
         # against each other; it now arcs forward instead, because
@@ -280,11 +287,9 @@ class KeyboardInput:
         "s": (-1, -1),
         "a": (0, 1),          # arc left, was spin left
         "d": (1, 0),          # arc right, was spin right
-        "z": (-1, 0),         # yaws left, backing
-        "c": (0, -1),         # yaws right, backing
         " ": (0, 0),
     }
-    HELP = "w/s drive  a/d arc  z/c back arc  space stop  x quit"
+    HELP = "w/s drive  a/d arc  space stop  x quit"
 
     def __init__(self):
         self.left = 0
@@ -498,6 +503,7 @@ def main() -> int:
     if not args.no_car:
         try:
             car = Car(port=args.port)
+            car.chirp(Car.TUNE_RECORD)
             print(f"bridge on {car.port}")
         except BridgeError as e:
             source.close()
