@@ -175,16 +175,42 @@ class FloorModel:
         return cv2.morphologyEx(m, cv2.MORPH_OPEN, ko)
 
 
-def free_profile(mask) -> np.ndarray:
+def free_profile(mask, min_obstacle: int = 1) -> np.ndarray:
     """Unbroken floor height per column, counting up from the bottom.
 
-    A column is only free as far as its first non-floor pixel — an
-    obstacle blocks everything behind it regardless of what the
-    floor does further up the frame.
+    A column is only free as far as the first thing blocking it — an
+    obstacle hides everything behind it regardless of what the floor
+    does further up the frame.
+
+    min_obstacle is how tall a run of not-floor has to be before it
+    counts as blocking. At 1 this is the original rule, where the
+    first stray pixel ends the column, and on a textured floor that
+    is brutal: a few pixels of wood grain lying across the bottom row
+    truncate a column that is otherwise clear to the horizon. That is
+    how a mask which is visibly almost all floor still reports
+    L 0 C 14 R 0 — the clearance is real, the profile just never gets
+    to see it.
+
+    Set it to the smallest vertical extent an obstacle worth avoiding
+    would occupy in frame. Shorter than that is read as texture and
+    driven straight over, which is the right call when the things
+    being dodged are large and the floor is patterned.
     """
     floor = mask > 0
+
+    if min_obstacle > 1:
+        # Keep only not-floor runs at least min_obstacle tall. The
+        # kernel is anchored at its BOTTOM row, so a pixel survives
+        # only when the run continues upward from it — which makes the
+        # surviving pixel the lowest one of the obstacle, exactly the
+        # height the search below wants to stop at.
+        k = np.ones((min_obstacle, 1), np.uint8)
+        solid = cv2.erode((~floor).astype(np.uint8), k,
+                          anchor=(0, min_obstacle - 1))
+        floor = solid == 0
+
     flipped = floor[::-1]                     # bottom row first
-    blocked = np.argmax(~flipped, axis=0)     # first non-floor going up
+    blocked = np.argmax(~flipped, axis=0)     # first blocker going up
     blocked[np.all(flipped, axis=0)] = mask.shape[0]   # never blocked
     return blocked
 
@@ -394,6 +420,11 @@ def main() -> int:
     ap.add_argument("--back-below", type=float, default=0.35,
                     help="turn while REVERSING when centre clearance falls below "
                          "this fraction of --go, instead of arcing forward into it")
+    ap.add_argument("--min-obstacle", type=int, default=1,
+                    help="pixels of continuous not-floor a column must hit "
+                         "before it counts as blocked. 1 is the old rule, where "
+                         "one speck of grain truncates a clear column. Raise it "
+                         "to the smallest obstacle you actually care about")
     ap.add_argument("--close", type=int, default=11,
                     help="fill not-floor gaps thinner than this many pixels — wood "
                          "grain and grout, not obstacles. Raise until the floor "
@@ -513,7 +544,7 @@ def main() -> int:
 
             frame = cam.frame()
             mask = floor.mask(frame, args.threshold, args.close)
-            prof = free_profile(mask)
+            prof = free_profile(mask, args.min_obstacle)
             regs = regions(prof)
 
             move = smoother.update(policy.decide(*regs, now), now)
