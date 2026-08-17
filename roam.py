@@ -87,7 +87,7 @@ class FloorModel:
     # quantised every 10 levels, so grain 20 levels darker than the
     # boards lands two bins away and reads as an obstacle. At 8 bins
     # it is the same bin as the floor and disappears.
-    BINS = 24
+    BINS = 6
 
     # channels into HSV, and the range of each, per mode.
     MODES = {
