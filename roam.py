@@ -327,6 +327,7 @@ class Policy:
         self._turning_since = None
         self._reverse_until = None
         self._escape_move = None
+        self._dodge_side = None
 
     def _escape(self, left_is_better: bool, now) -> str:
         """Back out of somewhere with no way through, turning as it goes.
@@ -360,9 +361,11 @@ class Policy:
             self._reverse_until = None
             self._escape_move = None
             self._turning_since = None    # turning gets a fresh chance
+            self._dodge_side = None       # and a fresh look before choosing
 
         if centre >= self.go:
             self._turning_since = None
+            self._dodge_side = None
             # Room ahead. Drift away from whichever side is closer
             # rather than holding course until it becomes an obstacle
             # and forces a hard turn. Costs contact operations that
@@ -384,22 +387,24 @@ class Policy:
         #                        something different
         #
         # Ties and near-ties break left so the tank does not dither.
-        left_is_better = not (right > left + self.turn_margin)
+        #
+        # Chosen once, then held until the way ahead opens or the
+        # retreat resets it. left and right are percentiles of a noisy
+        # mask and near an obstacle they sit close together, so
+        # re-deciding every frame lets that noise steer: the tank
+        # weaves at the thing rather than going round it, never
+        # commits far enough either way to find the gap, and ends up
+        # backing out of somewhere it could have driven past.
+        # Committing is most of what turns a dodge into a swerve.
+        if self._dodge_side is None:
+            self._dodge_side = "right" if right > left + self.turn_margin else "left"
+        left_is_better = self._dodge_side == "left"
 
         # Nowhere to go: neither side has enough room to be a way past,
         # so this is a corner or a wall rather than an obstacle with a
         # gap beside it. Straight back would return to this same spot
         # facing the same way.
         if max(left, right) < self.go * self.dodge_min:
-            return self._escape(left_is_better, now)
-
-        # There is room on one side, so try for it. If that has not
-        # worked for stuck_after seconds it was not the way past it
-        # looked like — usually something the floor model cannot see
-        # properly — and the retreat is the fallback.
-        if self._turning_since is None:
-            self._turning_since = now
-        elif now - self._turning_since > self.stuck_after:
             return self._escape(left_is_better, now)
 
         # Almost nothing ahead. A forward arc here would turn while
@@ -410,8 +415,27 @@ class Policy:
         # together and the turn comes from interrupting one of them.
         # Held, this chassis barely turns backwards at all.
         if centre < self.go * self.back_below:
+            # Only this branch counts toward being stuck, because it is
+            # the only one that is not getting anywhere. If backing and
+            # yawing has not opened the view in stuck_after seconds it
+            # is not going to, and the committed retreat is the
+            # fallback.
+            if self._turning_since is None:
+                self._turning_since = now
+            elif now - self._turning_since > self.stuck_after:
+                return self._escape(left_is_better, now)
             return "soft_back_left" if left_is_better else "soft_back_right"
 
+        # Room on one side and room to move: go round. This is the
+        # move the tank should spend most of its blocked time in.
+        #
+        # The stuck timer is cleared rather than left running. A
+        # forward arc IS progress — it covers ground while it turns —
+        # and timing it out was what turned every obstacle wider than
+        # a few seconds of arc into a retreat, however well the swerve
+        # was going. A tank arcing along a wall gets to the end of the
+        # wall; dodge_min above catches the corner when it arrives.
+        self._turning_since = None
         return "arc_left" if left_is_better else "arc_right"
 
 
@@ -485,7 +509,7 @@ def main() -> int:
     ap.add_argument("--no-servo", action="store_true",
                     help="do not raise the camera mast, and do not open the bridge "
                          "just to raise it when dry running")
-    ap.add_argument("--soft-margin", type=float, default=0.0,
+    ap.add_argument("--soft-margin", type=float, default=0.10,
                     help="how much clearer one side must be before drifting away "
                          "from the other while still going forward, as a fraction "
                          "of frame height. 0 disables the soft arc")
@@ -494,12 +518,12 @@ def main() -> int:
                          "costs contact life faster")
     ap.add_argument("--soft-duty", type=float, default=0.30,
                     help="fraction of each soft-arc cycle spent arcing")
-    ap.add_argument("--dodge-min", type=float, default=0.5,
+    ap.add_argument("--dodge-min", type=float, default=0.35,
                     help="room a side needs, as a fraction of --go, before it "
                          "counts as a way past rather than the less bad wall. "
                          "Below it on both sides, roam backs out and turns "
                          "instead of trying to squeeze through")
-    ap.add_argument("--back-below", type=float, default=0.35,
+    ap.add_argument("--back-below", type=float, default=0.22,
                     help="turn while REVERSING when centre clearance falls below "
                          "this fraction of --go, instead of arcing forward into it")
     ap.add_argument("--min-obstacle", type=int, default=1,
@@ -541,9 +565,12 @@ def main() -> int:
                     help="seconds of silence from this loop before the bridge "
                          "watchdog is allowed to release the relays "
                          "(default: five ticks, at least 0.5s)")
-    ap.add_argument("--cooldown", type=float, default=2.0,
-                    help="seconds between relay direction changes; decisions "
-                         "inside this window are retried, not dropped")
+    ap.add_argument("--reverse-cooldown", type=float, default=2.0,
+                    help="seconds before a motor may be reversed again — the "
+                         "one change that fights the motor's own momentum")
+    ap.add_argument("--cooldown", type=float, default=0.0,
+                    help="seconds before any gentler change — arc, stop, "
+                         "start. Raising this delays every swerve")
     ap.add_argument("--no-lock-exposure", action="store_true",
                     help="leave AE/AWB running (the floor model will drift)")
     ap.add_argument("--rotate", type=int, default=CAMERA_ROTATION, choices=(0, 180),
@@ -579,7 +606,8 @@ def main() -> int:
     if driving or not args.no_servo:
         try:
             car = Car(port=args.port, command_timeout=command_timeout,
-                      command_cooldown=args.cooldown)
+                      command_cooldown=args.cooldown,
+                      reverse_cooldown=args.reverse_cooldown)
             print(f"bridge on {car.port}  (releases after {command_timeout:.1f}s silent)")
             car.chirp(Car.TUNE_ROAM)
             warning = boot_warning(car.boot_reason)
