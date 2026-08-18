@@ -1,2 +1,2 @@
-python roam.py --debug-image roam.jpg --threshold 10 --min-obstacle 45 --close 20 --go 0.8 --bins 14 
+ python roam.py --debug-image roam.jpg --threshold 10 --min-obstacle 45 --close 20 --go 0.8 --bins 8 --min-interval 0.6 
 
