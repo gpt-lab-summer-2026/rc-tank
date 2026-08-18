@@ -95,7 +95,7 @@
      C A <0|1>     active low (1) or active high (0)
      C S <ms>      stagger between the two motors, 0 disables
      V <angle>     camera mast servo, 0-180. Negative lets it go limp
-     T <n>         play tune n (0 teleop, 1 roam, 2 record)
+     T <n>         play tune n (0 teleop, 1 roam, 2 record, 3 mast)
 
    Replies:
 
@@ -422,11 +422,21 @@ const Note TUNE_TELEOP[] = {{523, 90}, {659, 90}, {784, 150}};
 const Note TUNE_ROAM[]   = {{659, 80}, {784, 80}, {988, 80}, {1319, 160}};
 const Note TUNE_RECORD[] = {{784, 90}, {1047, 90}, {784, 90}, {1319, 160}};
 
+// Goofy on purpose, and short on purpose: this one plays every single
+// time the mast goes up, so it has to stay funny at the fiftieth
+// hearing rather than the first. A rising slide that trips over
+// itself twice on the way — it reads as the camera scrambling to its
+// feet, and at 320 ms it is done before the servo has finished.
+const Note TUNE_MAST[] = {
+  {659, 45}, {988, 45}, {784, 45}, {1319, 45}, {1047, 45}, {1568, 95},
+};
+
 struct Tune { const Note *notes; int count; };
 const Tune TUNES[] = {
   {TUNE_TELEOP, 3},
   {TUNE_ROAM,   4},
   {TUNE_RECORD, 4},
+  {TUNE_MAST,   6},
 };
 const int TUNE_COUNT = sizeof(TUNES) / sizeof(TUNES[0]);
 
