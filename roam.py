@@ -306,9 +306,18 @@ class Policy:
     is turning away from rather than creeping into it.
     """
 
+    # Every move that turns. Forward is the only one that does not,
+    # and the only one allowed to run without a deadline.
+    TURNS = frozenset((
+        "soft_arc_left", "soft_arc_right",
+        "arc_left", "arc_right",
+        "soft_back_left", "soft_back_right",
+    ))
+
     def __init__(self, go: float, turn_margin: float, stuck_after: float,
                  reverse_for: float, soft_margin: float = 0.0,
-                 back_below: float = 0.35, dodge_min: float = 0.5):
+                 back_below: float = 0.35, dodge_min: float = 0.5,
+                 max_turn: float = 4.0, straighten_for: float = 1.0):
         self.go = go                      # centre clearance to keep going
         self.turn_margin = turn_margin    # how much better a side must be
         self.stuck_after = stuck_after
@@ -324,10 +333,17 @@ class Policy:
         # bad wall. This is the whole difference between the two cases:
         # above it there is a way past, below it there is not.
         self.dodge_min = dodge_min
+        # How long any turning move may run before it is made to stop
+        # turning, whether or not it looks like it is getting
+        # anywhere. See _turn_expired.
+        self.max_turn = max_turn
+        self.straighten_for = straighten_for
         self._turning_since = None
         self._reverse_until = None
         self._escape_move = None
         self._dodge_side = None
+        self._turn_since = None
+        self._straighten_until = None
 
     def _escape(self, left_is_better: bool, now) -> str:
         """Back out of somewhere with no way through, turning as it goes.
@@ -363,6 +379,54 @@ class Policy:
             self._turning_since = None    # turning gets a fresh chance
             self._dodge_side = None       # and a fresh look before choosing
 
+        # Straightening out after a turn overran its limit. Cut it
+        # short if the view closes in: a forced forward is a recovery,
+        # not a licence to drive into something.
+        if self._straighten_until is not None:
+            if now < self._straighten_until and centre >= self.go * self.back_below:
+                return "forward"
+            self._straighten_until = None
+            self._dodge_side = None
+
+        move = self._choose(left, centre, right, now)
+
+        # An escape carries its own deadline, so it is not the cap's
+        # business. Neither is anything that is not a turn.
+        if self._reverse_until is not None or move not in self.TURNS:
+            self._turn_since = None
+            return move
+
+        if self._turn_since is None:
+            self._turn_since = now
+        elif now - self._turn_since > self.max_turn:
+            return self._turn_expired(centre, now)
+        return move
+
+    def _turn_expired(self, centre, now) -> str:
+        """A turn has been held for as long as it is safe to hold one.
+
+        One track idling cannot always move this chassis. On carpet,
+        against a skirting board, or nosed into anything at all, the
+        driving track stalls instead of turning — full current, no
+        motion, and on this hardware that is also how contacts weld
+        and how the 5V rail sags. Nothing in the picture says it is
+        happening, because a stalled tank and a slowly turning one
+        look much the same from a camera.
+
+        So turning gets a deadline and driving does not. Both tracks
+        pulling together is the thing most likely to break a stall one
+        track alone could not, which is why the way out of here is to
+        drive straight for a moment rather than to stop.
+        """
+        self._turn_since = None
+        if centre >= self.go * self.back_below:
+            self._straighten_until = now + self.straighten_for
+            self._dodge_side = None
+            return "forward"
+        # Nothing ahead worth driving into. Give ground instead.
+        return self._escape(self._dodge_side != "right", now)
+
+    def _choose(self, left, centre, right, now) -> str:
         if centre >= self.go:
             self._turning_since = None
             self._dodge_side = None
@@ -564,6 +628,15 @@ def main() -> int:
                     help="seconds between relay changes")
     ap.add_argument("--stuck-after", type=float, default=3.0,
                     help="seconds of turning before reversing")
+    ap.add_argument("--max-turn", type=float, default=4.0,
+                    help="longest any turning move may run. One track idling "
+                         "cannot always move this chassis, and a stalled "
+                         "track draws full current with nothing to show for "
+                         "it. Forward and reverse are not capped")
+    ap.add_argument("--straighten-for", type=float, default=1.0,
+                    help="seconds of driving straight after a turn hits "
+                         "--max-turn; both tracks together is what breaks a "
+                         "stall one track could not")
     ap.add_argument("--reverse-for", type=float, default=1.0,
                     help="seconds to reverse before trying to turn again")
     ap.add_argument("--adapt", type=float, default=0.0,
@@ -658,7 +731,8 @@ def main() -> int:
 
     policy = Policy(go_px, margin_px, args.stuck_after, args.reverse_for,
                     soft_margin=args.soft_margin * h, back_below=args.back_below,
-                    dodge_min=args.dodge_min)
+                    dodge_min=args.dodge_min, max_turn=args.max_turn,
+                    straighten_for=args.straighten_for)
     soft = SoftArc(period=args.soft_period, duty=args.soft_duty)
     smoother = Smoother(args.window, args.min_interval)
 
