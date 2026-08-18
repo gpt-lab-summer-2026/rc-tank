@@ -504,13 +504,18 @@ class Car:
         c, d = _DIR[right]
         return self._set((a, b, c, d), force=force)
 
-    def drive(self, left: int, right: int) -> str:
+    def drive(self, left: int, right: int, force: bool = False) -> str:
         """Set each track to -1 (reverse), 0 (stop) or +1 (forward).
 
         left and right mean the tank's own left and right. See
         SWAP_SIDES for how those reach the relay pairs.
+
+        force skips the cooldown. For ending something the caller
+        already started — letting a held arc expire, say — where
+        making the tank wait would strand it mid-manoeuvre in a state
+        nobody asked to hold.
         """
-        return self._drive(left, right)
+        return self._drive(left, right, force=force)
 
     def soft_arc(self, side: str, seconds: float = 1.0,
                  reverse: bool = False) -> bool:

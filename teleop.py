@@ -94,8 +94,8 @@ def mast_key(car: Car, action) -> str:
 HELP = """
   w  forward        s  backward
 
-  q  arc left       e  arc right      held until you press something else
-  a  soft arc left  d  soft arc right --arc-time seconds, then back
+  q  arc left       e  arc right      latched — stays until cancelled
+  a  arc left       d  arc right      hold the key, release to stop
   z  back arc left  c  back arc right same, both tracks reversing
 
   space  stop       x  quit
@@ -110,9 +110,17 @@ one pulls the nose round. They differ only in who ends them.
   q / e   latch. The tank keeps turning until you press w, space, or
           something else. Use them to come round a long way.
 
-  a / d   end themselves. One track drops out for --arc-time, then
-          both go back to exactly what they were doing. Use them to
-          correct a heading without giving up your course.
+  a / d   follow the key. Hold to keep turning; let go and the tracks
+          go straight back to what they were doing. Steer with these.
+          z / c are the same, backing up.
+
+Holding works by watching the terminal's key repeat, because a
+terminal cannot see a key being released — only that the same
+character has stopped arriving. So the turn runs on very briefly
+after you let go (--arc-release), and the first press is given longer
+(--arc-hold) to cover the pause before repeat starts. If a held arc
+stutters, raise --arc-hold; if it overshoots on release, lower
+--arc-release.
 
 There is no spin. Opposing the tracks reverses a motor under load,
 which is the harshest thing this drivetrain does to its contacts, and
@@ -225,8 +233,13 @@ def main() -> int:
     ap.add_argument("--cooldown", type=float, default=0.0,
                     help="seconds before any gentler change — arc, stop, "
                          "start — is allowed")
-    ap.add_argument("--arc-time", type=float, default=1.0,
-                    help="seconds to hold an arc before the tracks go back")
+    ap.add_argument("--arc-hold", type=float, default=0.7,
+                    help="how long the FIRST arc keypress lasts. Must outlast "
+                         "the terminal's delay before auto-repeat starts, or a "
+                         "held arc stutters")
+    ap.add_argument("--arc-release", type=float, default=0.25,
+                    help="how long an arc runs on after the last repeat. Lower "
+                         "feels snappier on release; too low and it stutters")
     ap.add_argument("--unstick-time", type=float, default=0.5,
                     help="seconds to drive backwards when r is pressed")
     args = ap.parse_args()
@@ -260,6 +273,23 @@ def main() -> int:
     saved = termios.tcgetattr(fd)
     quitting = False
 
+    # Hold-to-arc, inferred from auto-repeat.
+    #
+    # A terminal never reports a key release, so there is nothing to
+    # wait for. What it does report, while a key is down, is the same
+    # character over and over — so "still held" becomes "repeats are
+    # still arriving", and the arc ends when they stop.
+    #
+    # The two graces exist because the gaps are not equal. Terminals
+    # pause noticeably before the first repeat and then fire quickly,
+    # so one timeout either stutters at the start or hangs on after
+    # release. The first press gets the long allowance and every
+    # repeat after it the short one.
+    current = (0, 0)          # last latched command, restored after an arc
+    arc_until = None          # when the arc lapses, if one is running
+    arc_key = None            # which key is holding it
+    arc_seen_repeat = False
+
     try:
         tty.setcbreak(fd)
         while not quitting:
@@ -282,16 +312,36 @@ def main() -> int:
                 if key in ARCS or key in BACK_ARCS:
                     back = key in BACK_ARCS
                     side = BACK_ARCS[key] if back else ARCS[key]
-                    what = "back arc" if back else "soft arc"
-                    print(f"\r{what} {side:<6} one track idling ...", end="")
-                    sys.stdout.flush()
-                    try:
-                        if car.soft_arc(side, args.arc_time, reverse=back):
-                            print(" back on course      ")
-                        else:
-                            print(f" HELD {car.cooldown_remaining():.1f}s      ")
-                    except BridgeError as e:
-                        print(f"\rerror: {e}")
+
+                    if arc_key != key:
+                        # A fresh arc, or a switch of side mid-hold.
+                        # Idle the track that must travel less: going
+                        # forward that is the inside one, backing it is
+                        # the other, because the nose swings the other
+                        # way when the tracks pull the other way.
+                        base = -1 if back else 1
+                        lr = ((base, 0) if (side == "right") != back
+                              else (0, base))
+                        try:
+                            car.drive(*lr)
+                        except BridgeError as e:
+                            print(f"\rerror: {e}")
+                            continue
+                        if car.last_command_held:
+                            print(f"\rHELD {car.cooldown_remaining():.1f}s"
+                                  f"{'':<28}", end="")
+                            sys.stdout.flush()
+                            continue
+                        arc_key = key
+                        arc_seen_repeat = False
+                        what = "back arc" if back else "arc"
+                        print(f"\r{what} {side:<6} held{'':<24}", end="")
+                        sys.stdout.flush()
+                    else:
+                        arc_seen_repeat = True
+
+                    arc_until = time.monotonic() + (
+                        args.arc_release if arc_seen_repeat else args.arc_hold)
                     continue
                 if key in MAST:
                     try:
@@ -304,7 +354,12 @@ def main() -> int:
                 if key not in KEYS:
                     continue
 
+                # A latched order outranks a held arc. Cancel rather
+                # than let the arc lapse afterwards and overwrite it.
+                arc_until = arc_key = None
+
                 label, (left, right) = KEYS[key]
+                current = (left, right)
                 try:
                     reply = car.drive(left, right)
                 except BridgeError as e:
@@ -327,6 +382,25 @@ def main() -> int:
                 # \r and padding keep the status on one line in cbreak mode
                 print(f"\r{status}  relays[{applied}]      ", end="")
                 sys.stdout.flush()
+
+            # Outside the key loop on purpose: the arc ends when keys
+            # STOP arriving, so this has to run on the passes where
+            # nothing was pressed. read_keys blocks for its timeout,
+            # which is what paces it.
+            if arc_until is not None and time.monotonic() >= arc_until:
+                arc_until = arc_key = None
+                try:
+                    # Forced: the arc started this cooldown itself, and
+                    # holding the release would leave a track idling
+                    # that the operator has already let go of.
+                    reply = car.drive(*current, force=True)
+                    applied = " ".join(reply.split()[1:5])
+                    print(f"\rreleased      left={current[0]:+d} "
+                          f"right={current[1]:+d}  relays[{applied}]      ",
+                          end="")
+                    sys.stdout.flush()
+                except BridgeError as e:
+                    print(f"\rerror: {e}")
 
     except KeyboardInterrupt:
         pass

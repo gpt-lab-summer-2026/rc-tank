@@ -371,7 +371,14 @@ class Policy:
             # and forces a hard turn. Costs contact operations that
             # going straight does not, which is why soft_margin has
             # to be asked for.
-            if self.soft_margin > 0:
+            # Only when there is something to drift away FROM, though.
+            # A lopsided view of two clear sides — one wall three
+            # metres off, the other five — is not a reason to turn,
+            # and steering on the difference alone had the tank
+            # correcting its way across empty floor. If both sides are
+            # clearer than the distance wanted straight ahead, nothing
+            # needs avoiding yet: hold course.
+            if self.soft_margin > 0 and min(left, right) < self.go:
                 if left - right > self.soft_margin:
                     return "soft_arc_left"
                 if right - left > self.soft_margin:
