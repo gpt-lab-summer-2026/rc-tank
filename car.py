@@ -604,6 +604,7 @@ class Car:
     TUNE_TELEOP = 0
     TUNE_ROAM = 1
     TUNE_RECORD = 2
+    TUNE_MAST = 3
 
     def tune(self, n: int) -> str:
         """Play one of the firmware's tunes. Returns as it starts.
@@ -681,6 +682,11 @@ class Car:
         that then locks exposure on a view still swinging through
         frame.
         """
+        # Beep first, then move. The bridge plays tunes from its main
+        # loop rather than blocking in one, so the noise runs alongside
+        # the servo instead of delaying it — which is the point, since
+        # the joke is the sound the mast makes getting up.
+        self.chirp(self.TUNE_MAST)
         reply = self.mast(self.MAST_UP)
         time.sleep(settle)
         return reply
