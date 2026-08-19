@@ -52,10 +52,11 @@ def sweep(frame) -> int:
     """
     from roam import shrink
 
-    def run(scale=1.0, bins=FloorModel.BINS, close=11, minobs=1, pct=25, thresh=40):
+    def run(scale=1.0, bins=FloorModel.BINS, close=11, minobs=1, pct=25,
+            thresh=40, flatten=0.0):
         im = shrink(frame, scale)
         h = im.shape[0]
-        model = FloorModel(bins=bins)
+        model = FloorModel(bins=bins, flatten=flatten)
         model.learn(im)
         m = model.mask(im, thresh, close)
         prof = free_profile(m, minobs)
@@ -85,10 +86,14 @@ def sweep(frame) -> int:
     print("\n  --min-obstacle  (ignore blockers shorter than this)")
     for v in (10, 25, 40):
         row(f"min-obstacle {v}", minobs=v)
+    print("\n  --flatten  (divides the brightness gradient out; the shadow knob)")
+    for v in (30, 60, 120, 200):
+        row(f"flatten {v}", flatten=v)
     print("\n  combined")
     row("scale .33 bins 8", scale=0.33, bins=8)
     row("scale .25 bins 8", scale=0.25, bins=8)
     row("scale .25 bins 8 pct 50", scale=0.25, bins=8, pct=50)
+    row("scale .25 bins 8 flatten 60", scale=0.25, bins=8, flatten=60)
 
     print("\n  Pick the loosest row that still leaves a real obstacle showing.")
     print("  Put a box or a bag in view and run this again to check that.\n")

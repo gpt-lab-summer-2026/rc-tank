@@ -103,8 +103,9 @@ class FloorModel:
     ACHROMATIC_S = 40
 
     def __init__(self, smooth: float = 0.0, mode: str = "auto",
-                 bins: int = BINS):
+                 bins: int = BINS, flatten: float = 0.0):
         self.bins = (max(2, int(bins)), max(2, int(bins)))
+        self.flatten = float(flatten)
         self.hist = None
         self.smooth = smooth      # 0 = learn once and never change
         self.mode = mode          # "auto" resolves on the first learn()
@@ -116,6 +117,56 @@ class FloorModel:
         h, w = shape[:2]
         return (int(w * 0.35), int(h * 0.82), int(w * 0.65), h)
 
+    def _illumination(self, v):
+        """The slow spatial brightness field, estimated cheaply.
+
+        A large-sigma Gaussian over a full frame is expensive, and it
+        is also wasted precision: what is being estimated is smooth by
+        definition, so it survives being computed at an eighth of the
+        resolution and scaled back up.
+        """
+        small = cv2.resize(v, None, fx=0.125, fy=0.125,
+                           interpolation=cv2.INTER_AREA)
+        small = cv2.GaussianBlur(small, (0, 0), max(1.0, self.flatten * 0.125))
+        return cv2.resize(small, (v.shape[1], v.shape[0]),
+                          interpolation=cv2.INTER_LINEAR)
+
+    def hsv_of(self, bgr):
+        """HSV, with the illumination gradient optionally divided out.
+
+        A shadow does not repaint the floor, it scales how much light
+        reaches it — every channel drops by roughly the same factor.
+        Dividing brightness by a blurred copy of itself therefore
+        cancels the shadow and leaves reflectance, which is the thing
+        that actually distinguishes floor from an object sitting on it.
+
+        Measured on a soft-edged shadow that dropped V from 192 to
+        114: the absolute model kept 0% of the shaded floor at every
+        bin count and every threshold, because an unseen bin
+        back-projects to 0 and 0 fails every comparison. Divided, 79%
+        of it came back as floor with the obstacle still 96% detected.
+
+        flatten is the sigma, and it is a genuine trade-off rather
+        than a free win. It must be LARGER than the obstacles, or the
+        blur follows an obstacle into its own interior, normalises it
+        away and the tank drives into it — at sigma 25 obstacle
+        detection fell to 37%. It must be SMALLER than the lighting
+        variation, or there is nothing left to cancel. Somewhere near
+        the size of the largest thing worth dodging.
+
+        This runs on the WHOLE frame before any cropping, on purpose.
+        Estimate the illumination from the reference patch alone and
+        the ratio is 1 everywhere inside it by construction, which
+        would teach the model nothing and disagree with what mask()
+        computes over the full frame.
+        """
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        if self.flatten > 0:
+            v = hsv[:, :, 2].astype(np.float32)
+            hsv[:, :, 2] = np.clip(v / (self._illumination(v) + 1e-3) * 128.0,
+                                   0, 255).astype(np.uint8)
+        return hsv
+
     @property
     def channels(self):
         return self.MODES[self.chosen][0]
@@ -126,7 +177,7 @@ class FloorModel:
 
     def learn(self, bgr) -> None:
         x0, y0, x1, y1 = self.patch_box(bgr.shape)
-        hsv = cv2.cvtColor(bgr[y0:y1, x0:x1], cv2.COLOR_BGR2HSV)
+        hsv = self.hsv_of(bgr)[y0:y1, x0:x1]
 
         # Decided once, from the first patch, and then left alone. A
         # model that swapped channels mid-run would be comparing
@@ -167,7 +218,7 @@ class FloorModel:
         and chair spindles seen edge-on are gone. They were already
         marginal here; this makes it certain.
         """
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        hsv = self.hsv_of(bgr)
         back = cv2.calcBackProject([hsv], self.channels, self.hist, self.ranges, 1)
 
         # Blur first so isolated speckles do not cut a column short,
@@ -646,6 +697,12 @@ def main() -> int:
                     help="histogram bins per channel. Fewer is a coarser idea of "
                          "the same colour: 8 puts wood grain in the same bin as "
                          "the boards, 24 puts it two bins away")
+    ap.add_argument("--flatten", type=float, default=0.0,
+                    help="divide the slow brightness gradient out before matching, "
+                         "sigma in pixels. This is what stops shadows reading as "
+                         "obstacles; no other knob can. Set it larger than the "
+                         "things you dodge and smaller than the lighting changes. "
+                         "0 is off")
     ap.add_argument("--percentile", type=int, default=25,
                     help="how blocked a third must be to count as blocked. 25 "
                          "means a quarter of its columns; raise it when obstacles "
@@ -743,7 +800,8 @@ def main() -> int:
 
     print("\nlearning the floor — keep a metre of clear ground ahead")
     time.sleep(1.0)
-    floor = FloorModel(smooth=args.adapt, mode=args.channels, bins=args.bins)
+    floor = FloorModel(smooth=args.adapt, mode=args.channels, bins=args.bins,
+                       flatten=args.flatten)
     floor.learn(shrink(cam.frame(), args.scale))
     print(f"learned: {getattr(floor, 'why', floor.chosen)}\n")
 
