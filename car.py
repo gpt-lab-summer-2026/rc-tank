@@ -596,15 +596,19 @@ class Car:
     MAST_UP = 125
 
     # Where the mast points to look at the ROOM rather than the floor
-    # in front. Only used while stopped, so it can be well past
-    # anything that would make sense while driving.
+    # in front. Only used while stopped.
     #
-    # CHECK THIS AGAINST YOUR LINKAGE before using it. It is MAST_UP
-    # plus a nominal 40 degrees and nothing has measured whether the
-    # mechanism actually reaches it — servocheck.py --sweep prints the
-    # band that is quiet, and past the end of that band the servo jams
-    # against a stop and buzzes rather than reporting anything.
-    MAST_SURVEY = 165
+    # BELOW MAST_UP, not above it. On this linkage larger angles pitch
+    # the camera further down, so lifting its view means going toward
+    # MAST_DOWN, not away from it. Written as an offset rather than a
+    # number so that stays true if MAST_UP is retuned.
+    #
+    # Being between MAST_DOWN and MAST_UP also means this angle cannot
+    # be past a mechanical stop that the two everyday positions are not
+    # already past — which the far side of MAST_UP had no such
+    # guarantee about. servocheck.py --sweep is still the way to
+    # confirm it against the linkage.
+    MAST_SURVEY = MAST_UP - 40
 
     # ------------------------------------------------------- buzzer
 

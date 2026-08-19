@@ -604,13 +604,27 @@ class Smoother:
 # ------------------------------------------------------------- debug
 
 
-def annotate(bgr, mask, prof, regs, move, marks=()):
+def annotate(bgr, mask, prof, regs, move, marks=(), dets=(),
+             small_max: float = 1.0, det_age: float = 0.0):
     """Draw what the policy is looking at, over the frame it looked at.
 
     marks are horizontal reference lines — the thresholds the numbers
     are being compared against. Without them the red profile is just a
     squiggle; with them you can see at a glance whether a column
     clears the bar, which is the entire question the policy asks.
+
+    dets are drawn in two shades, because which ones get REPORTED is a
+    tuning decision and it should be visible. Anything at or under
+    small_max of the frame is something on the floor and is announced,
+    so it is drawn bright. Anything larger is a wall or a piece of
+    furniture that roam is already steering around, so it is drawn dim
+    and its area is labelled — which is what you read when deciding
+    whether --small-object is set where you want it.
+
+    det_age says how long ago the boxes were computed. Detection runs
+    on a worker thread and takes longer than a tick, so the boxes are
+    ALWAYS from an older frame than the pixels under them. Saying how
+    much older is the difference between a lagging box and a wrong one.
     """
     out = bgr.copy()
     green = np.zeros_like(out)
@@ -638,6 +652,29 @@ def annotate(bgr, mask, prof, regs, move, marks=()):
             out, f"{v:.0f}", (int(w * (i / 3 + 0.12)), 28),
             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
         )
+    for d in dets:
+        reported = d.area_frac <= small_max
+        colour = (0, 140, 255) if reported else (130, 130, 130)
+        bx0, by0, bx1, by1 = d.box
+        cv2.rectangle(out, (bx0, by0), (bx1, by1), colour, 2 if reported else 1)
+
+        tag = f"{d.label} {d.confidence:.0%}"
+        if not reported:
+            tag += f"  {d.area_frac:.0%} of frame"
+        (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+
+        # Above the box, or inside it when the box is against the top.
+        ty = by0 - 4 if by0 - th - 6 >= 0 else min(by1, by0 + th + 6)
+        tx = max(0, min(bx0, w - tw - 4))
+        cv2.rectangle(out, (tx, ty - th - 4), (tx + tw + 4, ty + 2), colour, -1)
+        cv2.putText(out, tag, (tx + 2, ty - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+
+    if dets:
+        note = f"{len(dets)} detected, {det_age:.1f}s ago"
+        cv2.putText(out, note, (w - 190, h - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 140, 255), 1)
+
     cv2.putText(
         out, move, (8, h - 10),
         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
@@ -892,7 +929,14 @@ def main() -> int:
             print(f"  !! no detector: {e}\n", file=sys.stderr)
 
     last_detect = 0.0
-    last_survey = time.monotonic()      # do not survey the instant it starts
+    last_survey = time.monotonic()
+    # Latest floor-context detections, kept so the view can draw them
+    # between runs rather than flashing them for one frame in six.
+    # Survey results are deliberately NOT kept: they were taken with
+    # the mast at a different angle, so their boxes mean nothing over
+    # a driving frame.
+    shown_dets: list = []
+    shown_at = 0.0      # do not survey the instant it starts
 
     def say(line: str) -> None:
         """Print above the status line without shredding it."""
@@ -1004,17 +1048,27 @@ def main() -> int:
                     last_detect = now
                     detector.submit(frame, "floor")
                 for found in detector.poll():
-                    small = [d for d in found if d.area_frac <= args.small_object]
+                    floor_dets = [d for d in found if d.context == "floor"]
+                    shown_dets, shown_at = floor_dets, now
+                    small = [d for d in floor_dets
+                             if d.area_frac <= args.small_object]
                     for d in reporter.fresh(small, now):
                         say(f"  saw {d.label} ({d.confidence:.0%}) on the floor"
                             f"  [{detector.last_ms:.0f} ms]")
+
+                # Expire them rather than leaving a box hanging over
+                # ground the tank drove past ten seconds ago.
+                if shown_dets and now - shown_at > max(2.0, args.detect_every * 2):
+                    shown_dets = []
 
             # One annotate() serves both the file and the stream, since
             # drawing it twice would double the cost for no gain.
             want_file = args.debug_image and now - last_debug > 1.0
             want_view = view is not None and now - last_view > view_period
             if want_file or want_view:
-                shown = annotate(frame, mask, prof, regs, move, marks)
+                shown = annotate(frame, mask, prof, regs, move, marks,
+                                 dets=shown_dets, small_max=args.small_object,
+                                 det_age=now - shown_at)
                 if want_file:
                     last_debug = now
                     cv2.imwrite(args.debug_image, shown)
