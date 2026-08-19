@@ -48,6 +48,7 @@ import numpy as np
 
 from car import BridgeError, Car, SoftArc, boot_warning
 from record import CAMERA_ROTATION, Camera
+from stream import MJPEGStreamer
 
 # ------------------------------------------------------- floor model
 
@@ -538,7 +539,14 @@ class Smoother:
 # ------------------------------------------------------------- debug
 
 
-def annotate(bgr, mask, prof, regs, move):
+def annotate(bgr, mask, prof, regs, move, marks=()):
+    """Draw what the policy is looking at, over the frame it looked at.
+
+    marks are horizontal reference lines — the thresholds the numbers
+    are being compared against. Without them the red profile is just a
+    squiggle; with them you can see at a glance whether a column
+    clears the bar, which is the entire question the policy asks.
+    """
     out = bgr.copy()
     green = np.zeros_like(out)
     green[:, :, 1] = mask
@@ -548,6 +556,14 @@ def annotate(bgr, mask, prof, regs, move):
     for x in range(0, w, 4):
         y = h - int(prof[x])
         cv2.circle(out, (x, y), 1, (0, 0, 255), -1)
+
+    # Thresholds, drawn where the profile has to reach to clear them.
+    for value, label, colour in marks:
+        y = int(h - value)
+        if 0 <= y < h:
+            cv2.line(out, (0, y), (w, y), colour, 1)
+            cv2.putText(out, label, (w - 78, max(12, y - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, colour, 1)
 
     x0, y0, x1, y1 = FloorModel.patch_box(bgr.shape)
     cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 0), 2)
@@ -656,6 +672,13 @@ def main() -> int:
     ap.add_argument("--rotate", type=int, default=CAMERA_ROTATION, choices=(0, 180),
                     help="turn each frame before anything looks at it "
                          f"(default {CAMERA_ROTATION}, this camera is mounted upside down)")
+    ap.add_argument("--stream", type=int, default=0, metavar="PORT",
+                    help="serve the annotated frame as MJPEG on this port, so "
+                         "the thing being tuned can be watched while it runs. "
+                         "0 is off")
+    ap.add_argument("--stream-fps", type=float, default=5.0,
+                    help="how often to publish a frame; annotating and encoding "
+                         "cost loop time, so this is deliberately below --fps")
     ap.add_argument("--debug-image", default=None, help="write an annotated frame here")
     args = ap.parse_args()
 
@@ -736,6 +759,29 @@ def main() -> int:
     soft = SoftArc(period=args.soft_period, duty=args.soft_duty)
     smoother = Smoother(args.window, args.min_interval)
 
+    view = None
+    if args.stream:
+        try:
+            view = MJPEGStreamer(port=args.stream)
+            print(f"live view on http://<this-pi>:{view.port}/")
+            print(f"  if the network will not route it, tunnel instead:")
+            print(f"    ssh -N -L {view.port}:localhost:{view.port} "
+                  f"{__import__('getpass').getuser()}@<this-pi>")
+            print(f"  then open http://localhost:{view.port}/\n")
+        except OSError as e:
+            print(f"  !! no live view: {e}", file=sys.stderr)
+
+    # Thresholds the policy compares against, in profile pixels, so
+    # annotate can draw them where they actually sit in the frame.
+    marks = [
+        (go_px, "go", (0, 255, 255)),
+        (go_px * args.dodge_min, "dodge", (255, 160, 0)),
+        (go_px * args.back_below, "back", (200, 0, 255)),
+    ]
+
+    last_view = 0.0
+    view_period = 1.0 / max(0.1, args.stream_fps)
+
     period = 1.0 / args.fps
     next_tick = time.monotonic()
     last_debug = 0.0
@@ -792,15 +838,26 @@ def main() -> int:
             )
             sys.stdout.flush()
 
-            if args.debug_image and now - last_debug > 1.0:
-                last_debug = now
-                cv2.imwrite(args.debug_image, annotate(frame, mask, prof, regs, move))
+            # One annotate() serves both the file and the stream, since
+            # drawing it twice would double the cost for no gain.
+            want_file = args.debug_image and now - last_debug > 1.0
+            want_view = view is not None and now - last_view > view_period
+            if want_file or want_view:
+                shown = annotate(frame, mask, prof, regs, move, marks)
+                if want_file:
+                    last_debug = now
+                    cv2.imwrite(args.debug_image, shown)
+                if want_view:
+                    last_view = now
+                    view.update(shown)
 
     except KeyboardInterrupt:
         pass
     finally:
         # Camera first: lowering the mast is a bridge command, so the
         # bridge has to still be open when it goes out.
+        if view is not None:
+            view.close()
         cam.close()
         if car is not None:
             car.close()
