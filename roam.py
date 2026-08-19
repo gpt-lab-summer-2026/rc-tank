@@ -697,6 +697,27 @@ def main() -> int:
                     help="histogram bins per channel. Fewer is a coarser idea of "
                          "the same colour: 8 puts wood grain in the same bin as "
                          "the boards, 24 puts it two bins away")
+    ap.add_argument("--detect", default=None, metavar="MODEL.onnx",
+                    help="YOLOv8/v11 ONNX model. Detection runs on a worker "
+                         "thread and never holds the driving loop up")
+    ap.add_argument("--detect-every", type=float, default=1.5,
+                    help="seconds between frames offered to the detector while "
+                         "roaming")
+    ap.add_argument("--detect-conf", type=float, default=0.40,
+                    help="confidence below which a detection is not reported")
+    ap.add_argument("--detect-threads", type=int, default=2,
+                    help="cores the model may use. All four starves the control "
+                         "loop, which is what this design exists to prevent")
+    ap.add_argument("--small-object", type=float, default=0.08,
+                    help="while driving, only report things smaller than this "
+                         "fraction of the frame. Bigger ones are the walls and "
+                         "furniture roam is already steering around")
+    ap.add_argument("--survey-every", type=float, default=0.0,
+                    help="seconds between survey stops: halt on clear floor, "
+                         "raise the mast to look at the room, report, carry on. "
+                         "0 is off")
+    ap.add_argument("--report-cooldown", type=float, default=25.0,
+                    help="seconds before the same label is announced again")
     ap.add_argument("--flatten", type=float, default=0.0,
                     help="divide the slow brightness gradient out before matching, "
                          "sigma in pixels. This is what stops shadows reading as "
@@ -854,6 +875,29 @@ def main() -> int:
     last_view = 0.0
     view_period = 1.0 / max(0.1, args.stream_fps)
 
+    detector = reporter = None
+    if args.detect:
+        try:
+            from detect import Detector, Reporter
+            detector = Detector(args.detect, conf=args.detect_conf,
+                                threads=args.detect_threads)
+            reporter = Reporter(cooldown=args.report_cooldown)
+            print(f"detector {args.detect} at {detector.size}x{detector.size}, "
+                  f"{args.detect_threads} threads")
+            if args.survey_every:
+                print(f"  survey stop every {args.survey_every:.0f}s, "
+                      f"mast to {Car.MAST_SURVEY}")
+            print()
+        except Exception as e:
+            print(f"  !! no detector: {e}\n", file=sys.stderr)
+
+    last_detect = 0.0
+    last_survey = time.monotonic()      # do not survey the instant it starts
+
+    def say(line: str) -> None:
+        """Print above the status line without shredding it."""
+        print("\r" + " " * 78 + "\r" + line, flush=True)
+
     period = 1.0 / args.fps
     next_tick = time.monotonic()
     last_debug = 0.0
@@ -896,6 +940,43 @@ def main() -> int:
             if args.adapt > 0 and regs[1] > go_px * 1.2:
                 floor.learn(frame)
 
+            # PATH 2. Stop somewhere clear, look up, say what is in the
+            # room, then carry on. Blocking here is fine and nowhere
+            # else is: the tank is stopped, so the watchdog releasing
+            # the relays is exactly what should happen while a survey
+            # runs long.
+            if (detector is not None and args.survey_every
+                    and move == "forward"
+                    and now - last_survey > args.survey_every):
+                last_survey = now
+                say("  survey: stopping to look around ...")
+                try:
+                    if car is not None and driving:
+                        car.stop()
+                        time.sleep(0.4)          # let it actually settle
+                    if car is not None:
+                        car.camera_survey()
+                    shot = shrink(cam.frame(), args.scale)
+                    found = detector.run_sync(shot, "survey")
+                    if found:
+                        for d in reporter.fresh(found, time.monotonic()):
+                            say(f"  room: {d.label} ({d.confidence:.0%})")
+                        say(f"  survey done, {len(found)} object(s), "
+                            f"{detector.last_ms:.0f} ms")
+                    else:
+                        say("  survey done, nothing recognised")
+                except Exception as e:
+                    say(f"  survey failed: {e}")
+                finally:
+                    if car is not None:
+                        car.mast_hold(Car.MAST_UP)
+                    # Force a fresh decision rather than resuming on a
+                    # vote taken before the tank stopped.
+                    smoother.buf.clear()
+                    smoother.current = "stop"
+                    next_tick = time.monotonic() + period
+                    last_survey = time.monotonic()
+
             # Restarts are shown inline rather than only at the end.
             # A bridge that reboots mid-run is the difference between
             # a car that is being driven and one that is coasting on
@@ -913,6 +994,20 @@ def main() -> int:
                 end="",
             )
             sys.stdout.flush()
+
+            # PATH 1. Offer the driving view to the detector and print
+            # anything small enough to be a thing ON the floor rather
+            # than a wall. Submitting never blocks; a frame arriving
+            # while the model is busy replaces the waiting one.
+            if detector is not None:
+                if now - last_detect > args.detect_every:
+                    last_detect = now
+                    detector.submit(frame, "floor")
+                for found in detector.poll():
+                    small = [d for d in found if d.area_frac <= args.small_object]
+                    for d in reporter.fresh(small, now):
+                        say(f"  saw {d.label} ({d.confidence:.0%}) on the floor"
+                            f"  [{detector.last_ms:.0f} ms]")
 
             # One annotate() serves both the file and the stream, since
             # drawing it twice would double the cost for no gain.
@@ -932,6 +1027,8 @@ def main() -> int:
     finally:
         # Camera first: lowering the mast is a bridge command, so the
         # bridge has to still be open when it goes out.
+        if detector is not None:
+            detector.close()
         if view is not None:
             view.close()
         cam.close()

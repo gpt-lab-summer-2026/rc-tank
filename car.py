@@ -595,6 +595,17 @@ class Car:
     MAST_DOWN = 0
     MAST_UP = 125
 
+    # Where the mast points to look at the ROOM rather than the floor
+    # in front. Only used while stopped, so it can be well past
+    # anything that would make sense while driving.
+    #
+    # CHECK THIS AGAINST YOUR LINKAGE before using it. It is MAST_UP
+    # plus a nominal 40 degrees and nothing has measured whether the
+    # mechanism actually reaches it — servocheck.py --sweep prints the
+    # band that is quiet, and past the end of that band the servo jams
+    # against a stop and buzzes rather than reporting anything.
+    MAST_SURVEY = 165
+
     # ------------------------------------------------------- buzzer
 
     # Tune indices, matching the TUNES table in the firmware. Keep the
@@ -688,6 +699,15 @@ class Car:
         # the joke is the sound the mast makes getting up.
         self.chirp(self.TUNE_MAST)
         reply = self.mast(self.MAST_UP)
+        time.sleep(settle)
+        return reply
+
+    def camera_survey(self, settle: float = 0.8) -> str:
+        """Point the mast at the room. Only meaningful while stopped."""
+        return self.mast_hold(self.MAST_SURVEY, settle)
+
+    def mast_hold(self, angle: int, settle: float = 0.8) -> str:
+        reply = self.mast(angle)
         time.sleep(settle)
         return reply
 
