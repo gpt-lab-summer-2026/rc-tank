@@ -46,6 +46,11 @@ ARCS = {"a": "left", "d": "right"}
 # so the interruption swings the nose instead of stalling it.
 BACK_ARCS = {"z": "left", "c": "right"}
 
+# Everything roam sees, driven by hand instead of by a policy. Loaded
+# lazily in main() so teleop still starts on a machine with no OpenCV
+# and no camera — driving the tank must not depend on being able to
+# look at it.
+
 # Camera mast. t and g are the two presets; the nudges exist so the
 # raised angle can be dialled in against the real linkage without
 # editing car.py and restarting, which is otherwise a reflash-speed
@@ -103,6 +108,9 @@ HELP = """
 
   t  mast up        g  mast down       v  mast limp
   +/-  nudge the mast 5 deg, to dial in the raised angle
+
+  l  look around: stop, raise the mast, say what the model sees
+     (needs --detect; --stream serves the same view roam would use)
 
 Both arcs steer the same way — the inside track idles and the outside
 one pulls the nose round. They differ only in who ends them.
@@ -242,6 +250,14 @@ def main() -> int:
                          "feels snappier on release; too low and it stutters")
     ap.add_argument("--unstick-time", type=float, default=0.5,
                     help="seconds to drive backwards when r is pressed")
+    ap.add_argument("--no-servo", action="store_true",
+                    help="do not raise the camera mast")
+    # The same flags roam uses, from the same definitions, so a value
+    # tuned while driving by hand means the same thing when roam runs.
+    from roam import add_perception_args, add_detect_args, add_view_args
+    add_perception_args(ap)
+    add_detect_args(ap)
+    add_view_args(ap)
     args = ap.parse_args()
 
     try:
@@ -269,6 +285,49 @@ def main() -> int:
 
     print(HELP)
 
+    # Perception is optional. Without --stream or --detect this is the
+    # same keyboard driver it always was, and nothing imports OpenCV.
+    cam = floor = view = detector = reporter = perceive = None
+    marks = []
+    shown_dets, shown_at, last_detect = [], 0.0, 0.0
+
+    if args.stream or args.detect:
+        try:
+            from record import Camera
+            from roam import FloorModel, perceive, annotate
+            from stream import MJPEGStreamer
+
+            cam = Camera(lock_exposure=not args.no_lock_exposure,
+                         rotate=args.rotate,
+                         mast=None if args.no_servo else car)
+            print("\nlearning the floor — keep a metre of clear ground ahead")
+            time.sleep(1.0)
+            floor = FloorModel(smooth=args.adapt, mode=args.channels,
+                               bins=args.bins, flatten=args.flatten)
+            from roam import shrink
+            floor.learn(shrink(cam.frame(), args.scale))
+            print(f"learned: {getattr(floor, 'why', floor.chosen)}")
+
+            from roam import marks_for
+            marks = marks_for(args, shrink(cam.frame(), args.scale).shape[0])
+
+            if args.stream:
+                view = MJPEGStreamer(port=args.stream)
+                print(f"live view on http://<this-pi>:{view.port}/  "
+                      f"(or tunnel: ssh -N -L {view.port}:localhost:{view.port} ...)")
+            if args.detect:
+                from detect import Detector, Reporter
+                detector = Detector(args.detect, conf=args.detect_conf,
+                                    threads=args.detect_threads)
+                reporter = Reporter(cooldown=args.report_cooldown)
+                print(f"detector {args.detect} at {detector.size}x{detector.size}")
+        except Exception as e:
+            print(f"  !! no camera view: {e}", file=sys.stderr)
+            cam = floor = None
+
+    def say(line: str) -> None:
+        print("\r" + " " * 78 + "\r" + line, flush=True)
+
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     quitting = False
@@ -293,7 +352,41 @@ def main() -> int:
     try:
         tty.setcbreak(fd)
         while not quitting:
-            for key in read_keys().lower():
+            keys = read_keys().lower()
+
+            # One perception pass per tick, using roam's own code path
+            # so what is drawn here is what roam would decide from —
+            # not a lookalike that drifts the first time either moves.
+            if cam is not None and floor is not None:
+                now = time.monotonic()
+                try:
+                    frame, mask, prof, regs = perceive(cam.frame(), floor, args)
+                except Exception:
+                    frame = None
+                if frame is not None:
+                    if detector is not None:
+                        if now - last_detect > args.detect_every:
+                            last_detect = now
+                            detector.submit(frame, "floor")
+                        for found in detector.poll():
+                            fl = [d for d in found if d.context == "floor"]
+                            shown_dets, shown_at = fl, now
+                            small = [d for d in fl
+                                     if d.area_frac <= args.small_object]
+                            for d in reporter.fresh(small, now):
+                                say(f"  saw {d.label} ({d.confidence:.0%}) "
+                                    f"on the floor  [{detector.last_ms:.0f} ms]")
+                        if shown_dets and now - shown_at > max(2.0, args.detect_every * 2):
+                            shown_dets = []
+                    if view is not None:
+                        L, C, R = regs
+                        view.update(annotate(frame, mask, prof, regs,
+                                             f"L{L:.0f} C{C:.0f} R{R:.0f}",
+                                             marks, dets=shown_dets,
+                                             small_max=args.small_object,
+                                             det_age=now - shown_at))
+
+            for key in keys:
                 if key == "x":
                     quitting = True
                     break
@@ -343,6 +436,28 @@ def main() -> int:
                     arc_until = time.monotonic() + (
                         args.arc_release if arc_seen_repeat else args.arc_hold)
                     continue
+                if key == "l":
+                    if detector is None or cam is None:
+                        say("  look around needs --detect")
+                        continue
+                    say("  looking around ...")
+                    try:
+                        car.stop()
+                        time.sleep(0.4)
+                        car.camera_survey()
+                        from roam import shrink as _shrink
+                        found = detector.run_sync(_shrink(cam.frame(), args.scale),
+                                                  "survey")
+                        for d in reporter.fresh(found, time.monotonic()):
+                            say(f"  room: {d.label} ({d.confidence:.0%})")
+                        say(f"  done, {len(found)} object(s), "
+                            f"{detector.last_ms:.0f} ms")
+                    except Exception as e:
+                        say(f"  look around failed: {e}")
+                    finally:
+                        car.mast_hold(Car.MAST_UP)
+                    continue
+
                 if key in MAST:
                     try:
                         print(f"\r{mast_key(car, MAST[key]):<44}", end="")
@@ -406,6 +521,12 @@ def main() -> int:
         pass
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        if detector is not None:
+            detector.close()
+        if view is not None:
+            view.close()
+        if cam is not None:
+            cam.close()          # lowers the mast, so before the bridge closes
         resets = car.resets
         car.close()
         print("\nstopped, port closed")

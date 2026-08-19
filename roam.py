@@ -685,16 +685,140 @@ def annotate(bgr, mask, prof, regs, move, marks=(), dets=(),
 # -------------------------------------------------------------- main
 
 
+def add_perception_args(ap) -> None:
+    """Flags for anything that runs the floor model.
+
+    Defined here and shared rather than repeated per script, so a
+    default tuned in one place cannot quietly disagree with the
+    same flag somewhere else.
+    """
+    ap.add_argument("--go", type=float, default=0.45,
+                    help="centre clearance to keep going, as a fraction of frame height")
+    ap.add_argument("--threshold", type=int, default=40, help="floor match strictness 0-255")
+    ap.add_argument("--min-obstacle", type=int, default=1,
+                    help="pixels of continuous not-floor a column must hit "
+                         "before it counts as blocked. 1 is the old rule, where "
+                         "one speck of grain truncates a clear column. Raise it "
+                         "to the smallest obstacle you actually care about")
+    ap.add_argument("--close", type=int, default=11,
+                    help="fill not-floor gaps thinner than this many pixels — wood "
+                         "grain and grout, not obstacles. Raise until the floor "
+                         "stops speckling; anything thinner is erased with it")
+    ap.add_argument("--scale", type=float, default=1.0,
+                    help="shrink each frame by this factor before looking at it. "
+                         "0.25 turns 640x480 into 160x120, which averages floor "
+                         "texture away before the histogram ever sees it and runs "
+                         "far faster. NOTE --close and --min-obstacle are in "
+                         "pixels, so they shrink with it")
+    ap.add_argument("--bins", type=int, default=FloorModel.BINS,
+                    help="histogram bins per channel. Fewer is a coarser idea of "
+                         "the same colour: 8 puts wood grain in the same bin as "
+                         "the boards, 24 puts it two bins away")
+    ap.add_argument("--flatten", type=float, default=0.0,
+                    help="divide the slow brightness gradient out before matching, "
+                         "sigma in pixels. This is what stops shadows reading as "
+                         "obstacles; no other knob can. Set it larger than the "
+                         "things you dodge and smaller than the lighting changes. "
+                         "0 is off")
+    ap.add_argument("--percentile", type=int, default=25,
+                    help="how blocked a third must be to count as blocked. 25 "
+                         "means a quarter of its columns; raise it when obstacles "
+                         "are wide and texture is what is truncating columns")
+    ap.add_argument("--channels", default="auto", choices=("auto", "hs", "sv"),
+                    help="which two HSV channels model the floor. auto picks sv on a "
+                         "grey floor, where hue is noise, and hs where there is colour")
+    ap.add_argument("--adapt", type=float, default=0.0,
+                    help="floor model blend rate, 0 learns once")
+    ap.add_argument("--no-lock-exposure", action="store_true",
+                    help="leave AE/AWB running (the floor model will drift)")
+    ap.add_argument("--rotate", type=int, default=CAMERA_ROTATION, choices=(0, 180),
+                    help="turn each frame before anything looks at it "
+                         f"(default {CAMERA_ROTATION}, this camera is mounted upside down)")
+
+
+def add_detect_args(ap) -> None:
+    """Flags for anything that runs the object detector.
+
+    Defined here and shared rather than repeated per script, so a
+    default tuned in one place cannot quietly disagree with the
+    same flag somewhere else.
+    """
+    ap.add_argument("--detect", default=None, metavar="MODEL.onnx",
+                    help="YOLOv8/v11 ONNX model. Detection runs on a worker "
+                         "thread and never holds the driving loop up")
+    ap.add_argument("--detect-every", type=float, default=1.5,
+                    help="seconds between frames offered to the detector while "
+                         "roaming")
+    ap.add_argument("--detect-conf", type=float, default=0.40,
+                    help="confidence below which a detection is not reported")
+    ap.add_argument("--detect-threads", type=int, default=2,
+                    help="cores the model may use. All four starves the control "
+                         "loop, which is what this design exists to prevent")
+    ap.add_argument("--small-object", type=float, default=0.08,
+                    help="while driving, only report things smaller than this "
+                         "fraction of the frame. Bigger ones are the walls and "
+                         "furniture roam is already steering around")
+    ap.add_argument("--report-cooldown", type=float, default=25.0,
+                    help="seconds before the same label is announced again")
+
+
+def add_view_args(ap) -> None:
+    """Flags for anything that serves a live picture.
+
+    Defined here and shared rather than repeated per script, so a
+    default tuned in one place cannot quietly disagree with the
+    same flag somewhere else.
+    """
+    ap.add_argument("--stream", type=int, default=0, metavar="PORT",
+                    help="serve the annotated frame as MJPEG on this port, so "
+                         "the thing being tuned can be watched while it runs. "
+                         "0 is off")
+    ap.add_argument("--stream-fps", type=float, default=5.0,
+                    help="how often to publish a frame; annotating and encoding "
+                         "cost loop time, so this is deliberately below --fps")
+
+
+def marks_for(args, h):
+    """The threshold lines annotate() draws, in profile pixels.
+
+    getattr with roam's own defaults, because the policy flags these
+    come from are roam's and teleop does not register them — but the
+    lines are just as useful when driving by hand, which is when you
+    are deciding where to put them.
+    """
+    go_px = args.go * h
+    return [
+        (go_px, "go", (0, 255, 255)),
+        (go_px * getattr(args, "dodge_min", 0.35), "dodge", (255, 160, 0)),
+        (go_px * getattr(args, "back_below", 0.22), "back", (200, 0, 255)),
+    ]
+
+
+def perceive(raw, floor, args):
+    """Frame in, everything the policy reads out.
+
+    Shared so teleop shows exactly what roam would decide from, rather
+    than an approximation of it that drifts the first time either is
+    tuned.
+    """
+    frame = shrink(raw, args.scale)
+    mask = floor.mask(frame, args.threshold, args.close)
+    prof = free_profile(mask, args.min_obstacle)
+    return frame, mask, prof, regions(prof, args.percentile)
+
+
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
+    add_perception_args(ap)
+    add_detect_args(ap)
+    add_view_args(ap)
     ap.add_argument("--port", default=None, help="ESP32 serial device")
     ap.add_argument("--dry-run", action="store_true", help="decide but do not drive")
     ap.add_argument("--fps", type=float, default=10.0, help="decisions per second")
-    ap.add_argument("--go", type=float, default=0.45,
-                    help="centre clearance to keep going, as a fraction of frame height")
     ap.add_argument("--turn-margin", type=float, default=0.05,
                     help="how much clearer one side must be, as a fraction")
-    ap.add_argument("--threshold", type=int, default=40, help="floor match strictness 0-255")
     ap.add_argument("--no-servo", action="store_true",
                     help="do not raise the camera mast, and do not open the bridge "
                          "just to raise it when dry running")
@@ -715,59 +839,10 @@ def main() -> int:
     ap.add_argument("--back-below", type=float, default=0.22,
                     help="turn while REVERSING when centre clearance falls below "
                          "this fraction of --go, instead of arcing forward into it")
-    ap.add_argument("--min-obstacle", type=int, default=1,
-                    help="pixels of continuous not-floor a column must hit "
-                         "before it counts as blocked. 1 is the old rule, where "
-                         "one speck of grain truncates a clear column. Raise it "
-                         "to the smallest obstacle you actually care about")
-    ap.add_argument("--close", type=int, default=11,
-                    help="fill not-floor gaps thinner than this many pixels — wood "
-                         "grain and grout, not obstacles. Raise until the floor "
-                         "stops speckling; anything thinner is erased with it")
-    ap.add_argument("--scale", type=float, default=1.0,
-                    help="shrink each frame by this factor before looking at it. "
-                         "0.25 turns 640x480 into 160x120, which averages floor "
-                         "texture away before the histogram ever sees it and runs "
-                         "far faster. NOTE --close and --min-obstacle are in "
-                         "pixels, so they shrink with it")
-    ap.add_argument("--bins", type=int, default=FloorModel.BINS,
-                    help="histogram bins per channel. Fewer is a coarser idea of "
-                         "the same colour: 8 puts wood grain in the same bin as "
-                         "the boards, 24 puts it two bins away")
-    ap.add_argument("--detect", default=None, metavar="MODEL.onnx",
-                    help="YOLOv8/v11 ONNX model. Detection runs on a worker "
-                         "thread and never holds the driving loop up")
-    ap.add_argument("--detect-every", type=float, default=1.5,
-                    help="seconds between frames offered to the detector while "
-                         "roaming")
-    ap.add_argument("--detect-conf", type=float, default=0.40,
-                    help="confidence below which a detection is not reported")
-    ap.add_argument("--detect-threads", type=int, default=2,
-                    help="cores the model may use. All four starves the control "
-                         "loop, which is what this design exists to prevent")
-    ap.add_argument("--small-object", type=float, default=0.08,
-                    help="while driving, only report things smaller than this "
-                         "fraction of the frame. Bigger ones are the walls and "
-                         "furniture roam is already steering around")
     ap.add_argument("--survey-every", type=float, default=0.0,
                     help="seconds between survey stops: halt on clear floor, "
                          "raise the mast to look at the room, report, carry on. "
                          "0 is off")
-    ap.add_argument("--report-cooldown", type=float, default=25.0,
-                    help="seconds before the same label is announced again")
-    ap.add_argument("--flatten", type=float, default=0.0,
-                    help="divide the slow brightness gradient out before matching, "
-                         "sigma in pixels. This is what stops shadows reading as "
-                         "obstacles; no other knob can. Set it larger than the "
-                         "things you dodge and smaller than the lighting changes. "
-                         "0 is off")
-    ap.add_argument("--percentile", type=int, default=25,
-                    help="how blocked a third must be to count as blocked. 25 "
-                         "means a quarter of its columns; raise it when obstacles "
-                         "are wide and texture is what is truncating columns")
-    ap.add_argument("--channels", default="auto", choices=("auto", "hs", "sv"),
-                    help="which two HSV channels model the floor. auto picks sv on a "
-                         "grey floor, where hue is noise, and hs where there is colour")
     ap.add_argument("--window", type=int, default=5, help="frames in the majority vote")
     ap.add_argument("--min-interval", type=float, default=0.2,
                     help="seconds between relay changes")
@@ -784,8 +859,6 @@ def main() -> int:
                          "stall one track could not")
     ap.add_argument("--reverse-for", type=float, default=1.0,
                     help="seconds to reverse before trying to turn again")
-    ap.add_argument("--adapt", type=float, default=0.0,
-                    help="floor model blend rate, 0 learns once")
     ap.add_argument("--command-timeout", type=float, default=None,
                     help="seconds of silence from this loop before the bridge "
                          "watchdog is allowed to release the relays "
@@ -796,18 +869,6 @@ def main() -> int:
     ap.add_argument("--cooldown", type=float, default=0.0,
                     help="seconds before any gentler change — arc, stop, "
                          "start. Raising this delays every swerve")
-    ap.add_argument("--no-lock-exposure", action="store_true",
-                    help="leave AE/AWB running (the floor model will drift)")
-    ap.add_argument("--rotate", type=int, default=CAMERA_ROTATION, choices=(0, 180),
-                    help="turn each frame before anything looks at it "
-                         f"(default {CAMERA_ROTATION}, this camera is mounted upside down)")
-    ap.add_argument("--stream", type=int, default=0, metavar="PORT",
-                    help="serve the annotated frame as MJPEG on this port, so "
-                         "the thing being tuned can be watched while it runs. "
-                         "0 is off")
-    ap.add_argument("--stream-fps", type=float, default=5.0,
-                    help="how often to publish a frame; annotating and encoding "
-                         "cost loop time, so this is deliberately below --fps")
     ap.add_argument("--debug-image", default=None, help="write an annotated frame here")
     args = ap.parse_args()
 
@@ -903,11 +964,7 @@ def main() -> int:
 
     # Thresholds the policy compares against, in profile pixels, so
     # annotate can draw them where they actually sit in the frame.
-    marks = [
-        (go_px, "go", (0, 255, 255)),
-        (go_px * args.dodge_min, "dodge", (255, 160, 0)),
-        (go_px * args.back_below, "back", (200, 0, 255)),
-    ]
+    marks = marks_for(args, h)
 
     last_view = 0.0
     view_period = 1.0 / max(0.1, args.stream_fps)
@@ -955,10 +1012,7 @@ def main() -> int:
                 continue
             next_tick = max(now + period, next_tick + period)
 
-            frame = shrink(cam.frame(), args.scale)
-            mask = floor.mask(frame, args.threshold, args.close)
-            prof = free_profile(mask, args.min_obstacle)
-            regs = regions(prof, args.percentile)
+            frame, mask, prof, regs = perceive(cam.frame(), floor, args)
 
             move = smoother.update(policy.decide(*regs, now), now)
             decision = tracks_for(move, now, soft)
