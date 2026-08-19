@@ -1,2 +1,2 @@
-python roam.py --debug-image roam.jpg --threshold 65 --min-obstacle 45 --close 20 --go 0.7 --bins 12 --min-interval 0.6 --stream 8080 --dry-run --flatten 30
+python roam.py --debug-image roam.jpg --threshold 30 --min-obstacle 45 --close 20 --go 0.7 --bins 12 --min-interval 0.6 --stream 8080 --flatten 30 --dry-run
 
