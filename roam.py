@@ -345,6 +345,17 @@ class Policy:
         self._turn_since = None
         self._straighten_until = None
 
+        # Why the last move was chosen. There is no way to argue with
+        # "it reversed for no reason" without this: every branch below
+        # is a decision about numbers nobody wrote down, and by the
+        # time the tank has backed up the numbers are gone.
+        self.reason = "start"
+        self.reversals = 0
+
+    def _say(self, reason: str, move: str) -> str:
+        self.reason = reason
+        return move
+
     def _escape(self, left_is_better: bool, now) -> str:
         """Back out of somewhere with no way through, turning as it goes.
 
@@ -363,6 +374,7 @@ class Policy:
                              else "soft_back_right")
         self._reverse_until = now + self.reverse_for
         self._turning_since = None
+        self.reversals += 1
         return self._escape_move
 
     def decide(self, left, centre, right, now) -> str:
@@ -373,7 +385,7 @@ class Policy:
         # knows about where the tank is going.
         if self._reverse_until is not None:
             if now < self._reverse_until:
-                return self._escape_move
+                return self._say(self.reason, self._escape_move)
             self._reverse_until = None
             self._escape_move = None
             self._turning_since = None    # turning gets a fresh chance
@@ -384,7 +396,7 @@ class Policy:
         # not a licence to drive into something.
         if self._straighten_until is not None:
             if now < self._straighten_until and centre >= self.go * self.back_below:
-                return "forward"
+                return self._say("straightening", "forward")
             self._straighten_until = None
             self._dodge_side = None
 
@@ -422,9 +434,10 @@ class Policy:
         if centre >= self.go * self.back_below:
             self._straighten_until = now + self.straighten_for
             self._dodge_side = None
-            return "forward"
+            return self._say("turn-capped", "forward")
         # Nothing ahead worth driving into. Give ground instead.
-        return self._escape(self._dodge_side != "right", now)
+        return self._say("turn-capped-blocked",
+                         self._escape(self._dodge_side != "right", now))
 
     def _choose(self, left, centre, right, now) -> str:
         if centre >= self.go:
@@ -444,10 +457,10 @@ class Policy:
             # needs avoiding yet: hold course.
             if self.soft_margin > 0 and min(left, right) < self.go:
                 if left - right > self.soft_margin:
-                    return "soft_arc_left"
+                    return self._say("drift", "soft_arc_left")
                 if right - left > self.soft_margin:
-                    return "soft_arc_right"
-            return "forward"
+                    return self._say("drift", "soft_arc_right")
+            return self._say("clear", "forward")
 
         # Blocked ahead. The question is now which of two situations
         # this is, and they want opposite things:
@@ -476,7 +489,7 @@ class Policy:
         # gap beside it. Straight back would return to this same spot
         # facing the same way.
         if max(left, right) < self.go * self.dodge_min:
-            return self._escape(left_is_better, now)
+            return self._say("boxed-in", self._escape(left_is_better, now))
 
         # Almost nothing ahead. A forward arc here would turn while
         # driving into the thing being turned away from, so give up the
@@ -494,8 +507,9 @@ class Policy:
             if self._turning_since is None:
                 self._turning_since = now
             elif now - self._turning_since > self.stuck_after:
-                return self._escape(left_is_better, now)
-            return "soft_back_left" if left_is_better else "soft_back_right"
+                return self._say("no-progress", self._escape(left_is_better, now))
+            return self._say("too-close",
+                             "soft_back_left" if left_is_better else "soft_back_right")
 
         # Room on one side and room to move: go round. This is the
         # move the tank should spend most of its blocked time in.
@@ -507,7 +521,7 @@ class Policy:
         # was going. A tank arcing along a wall gets to the end of the
         # wall; dodge_min above catches the corner when it arrives.
         self._turning_since = None
-        return "arc_left" if left_is_better else "arc_right"
+        return self._say("dodge", "arc_left" if left_is_better else "arc_right")
 
 
 class Smoother:
@@ -785,9 +799,13 @@ def main() -> int:
             resets = f"  RESETS {car.resets}" if car is not None and car.resets else ""
             if car is not None and car.last_command_held:
                 resets += f"  HELD {car.cooldown_remaining():.1f}s"
+            # The reason matters more than the move. A reverse is only
+            # ever one of four decisions, and which one says whether to
+            # go and look at the mask or at the tank's speed.
             print(
                 f"\rL {regs[0]:5.0f}  C {regs[1]:5.0f}  R {regs[2]:5.0f}   "
-                f"go>{go_px:.0f}   {move:<15}{resets}",
+                f"go>{go_px:.0f}   {move:<15} {policy.reason:<18}"
+                f"back x{policy.reversals}{resets}",
                 end="",
             )
             sys.stdout.flush()
