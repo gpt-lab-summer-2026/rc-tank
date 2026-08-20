@@ -366,7 +366,8 @@ class Policy:
         "soft_back_left", "soft_back_right",
     ))
 
-    def __init__(self, go: float, commit: float, turn_margin: float, stuck_after: float,
+    def __init__(self, go: float, commit: float, even: float,
+                 turn_margin: float, stuck_after: float,
                  reverse_for: float, soft_margin: float = 0.0,
                  back_below: float = 0.35, dodge_min: float = 0.5,
                  max_turn: float = 4.0, straighten_for: float = 1.0):
@@ -374,6 +375,9 @@ class Policy:
         # Above this the centre is not merely passable but plainly
         # open, and nothing either side is worth turning for.
         self.commit = commit
+        # And above this the WORST of the three is still fine, so
+        # there is no better direction to turn toward.
+        self.even = even
         self.turn_margin = turn_margin    # how much better a side must be
         self.stuck_after = stuck_after
         self.reverse_for = reverse_for
@@ -511,6 +515,20 @@ class Policy:
             self._turning_since = None
             self._dodge_side = None
             return self._say("committed", "forward")
+
+        # Nothing is notably worse than anything else, and none of it
+        # is tight. A turn is only ever worth making because some
+        # direction is BETTER; when the worst of the three is still
+        # comfortable there is no better, so turning buys nothing and
+        # costs the heading.
+        #
+        # This is checked before the centre-clearance rule on purpose,
+        # so it holds even when --go is set high enough that an evenly
+        # clearish view would otherwise read as blocked and get dodged.
+        if min(left, centre, right) >= self.even:
+            self._turning_since = None
+            self._dodge_side = None
+            return self._say("all-clear", "forward")
 
         if centre >= self.go:
             self._turning_since = None
@@ -717,6 +735,11 @@ def add_perception_args(ap) -> None:
                          "which roam drives straight and ignores both sides "
                          "entirely. Stops it grooming its way around a room "
                          "instead of crossing it. 0.625 is 300px at 480 high")
+    ap.add_argument("--even-above", type=float, default=0.5625,
+                    help="when the WORST of left, centre and right is above this "
+                         "fraction of frame height, go straight. Nothing is worse "
+                         "than anything else, so no turn improves matters. "
+                         "0.5625 is 270px at 480 high")
     ap.add_argument("--go", type=float, default=0.45,
                     help="centre clearance to keep going, as a fraction of frame height")
     ap.add_argument("--threshold", type=int, default=40, help="floor match strictness 0-255")
@@ -969,7 +992,8 @@ def main() -> int:
     go_px = args.go * h
     margin_px = args.turn_margin * h
 
-    policy = Policy(go_px, args.commit_above * h, margin_px,
+    policy = Policy(go_px, args.commit_above * h, args.even_above * h,
+                    margin_px,
                     args.stuck_after, args.reverse_for,
                     soft_margin=args.soft_margin * h, back_below=args.back_below,
                     dodge_min=args.dodge_min, max_turn=args.max_turn,
