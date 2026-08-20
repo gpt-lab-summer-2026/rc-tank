@@ -260,7 +260,8 @@ class FloorModel:
                  f"{m.chosen}, bins {m.bins[0]}, flatten {m.flatten:.0f}")
         return m
 
-    def mask(self, bgr, threshold: int = 40, close_px: int = 11):
+    def mask(self, bgr, threshold: int = 40, close_px: int = 11,
+             horizon: float = 0.0):
         """255 where the pixel looks like floor.
 
         close_px is what separates floor texture from obstacles, and it
@@ -295,7 +296,27 @@ class FloorModel:
         kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_px, close_px))
         ko = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kc)
-        return cv2.morphologyEx(m, cv2.MORPH_OPEN, ko)
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, ko)
+
+        # Above the horizon nothing is driveable, whatever colour it
+        # is. That is geometry, not appearance, and it is the only
+        # thing here a colour model cannot argue with.
+        #
+        # It needs saying explicitly because both of the tools that
+        # widen the model's idea of floor will otherwise swallow the
+        # wall. --flatten divides brightness by a local blur, which
+        # makes ANY locally-uniform surface normalise to the same
+        # value — a flat wall and a flat floor come out identical. And
+        # a profile accumulated across a room lit from one end spans
+        # far enough that the floor's shaded end reaches the wall's
+        # brightness. Measured with a wall at 118 and floor from 115 to
+        # 210, both routes called the wall floor over 96% of the time.
+        #
+        # A column that keeps counting past the horizon reports
+        # clearance to infinity and the tank drives into the wall.
+        if horizon > 0:
+            m[: int(m.shape[0] * horizon)] = 0
+        return m
 
 
 def shrink(bgr, scale: float):
@@ -831,6 +852,12 @@ def add_perception_args(ap) -> None:
                          "obstacles; no other knob can. Set it larger than the "
                          "things you dodge and smaller than the lighting changes. "
                          "0 is off")
+    ap.add_argument("--horizon", type=float, default=0.0,
+                    help="rows above this fraction of the frame are never floor, "
+                         "whatever they look like. Set it to where the horizon "
+                         "sits when the camera is pitched to see past the floor. "
+                         "Only the navigation mask is clipped — the object "
+                         "detector still sees the whole frame")
     ap.add_argument("--percentile", type=int, default=25,
                     help="how blocked a third must be to count as blocked. 25 "
                          "means a quarter of its columns; raise it when obstacles "
@@ -918,7 +945,7 @@ def perceive(raw, floor, args):
     tuned.
     """
     frame = shrink(raw, args.scale)
-    mask = floor.mask(frame, args.threshold, args.close)
+    mask = floor.mask(frame, args.threshold, args.close, args.horizon)
     prof = free_profile(mask, args.min_obstacle)
     return frame, mask, prof, regions(prof, args.percentile)
 
