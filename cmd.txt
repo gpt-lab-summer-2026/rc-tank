@@ -1,2 +1,2 @@
-python roam.py --debug-image roam.jpg --threshold 50 --min-obstacle 45 --close 20 --go 0.7 --bins 12 --min-interval 0.6 --stream 8080 --flatten 30 --detect yolo11n.onnx 
+python roam.py --debug-image roam.jpg --threshold 14 --min-obstacle 16 --close 20 --go 0.45 --bins 12 --min-interval 0.6 --stream 8080 --flatten 75 --detect yolo11n.onnx --dry-run
 

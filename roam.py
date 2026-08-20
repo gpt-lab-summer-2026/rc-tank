@@ -1069,6 +1069,31 @@ def main() -> int:
     go_px = args.go * h
     margin_px = args.turn_margin * h
 
+    # A camera pitched to see over the horizon caps how much floor any
+    # column can ever show: nothing above the horizon is floor, so the
+    # profile stops there no matter how empty the room is. A threshold
+    # set above that cap can never be met, and the branch behind it is
+    # dead code that reads as "permanently blocked" instead.
+    probe = free_profile(floor.mask(shrink(cam.frame(), args.scale),
+                                    args.threshold, args.close),
+                         args.min_obstacle)
+    reach = float(probe.max())
+    print(f"most clearance any column can show right now: {reach:.0f}px "
+          f"({reach / h:.2f} of frame)")
+    for name, want in (("--go", go_px),
+                       ("--even-above", args.even_above * h),
+                       ("--commit-above", args.commit_above * h)):
+        if want > reach:
+            print(f"  !! {name} wants {want:.0f}px, which is more than anything "
+                  f"here can reach.\n     That test can never pass — lower it "
+                  f"below {reach:.0f} ({reach / h:.2f}).", file=sys.stderr)
+    if go_px >= args.commit_above * h:
+        print(f"  !! --go ({go_px:.0f}) is not below --commit-above "
+              f"({args.commit_above * h:.0f}).\n     They are checked in the "
+              f"order commit, even, go, so go never gets a turn.",
+              file=sys.stderr)
+    print()
+
     policy = Policy(go_px, args.commit_above * h, args.even_above * h,
                     margin_px,
                     args.stuck_after, args.reverse_for,
