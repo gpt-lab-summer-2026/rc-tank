@@ -197,6 +197,69 @@ class FloorModel:
         else:
             self.hist = (1 - self.smooth) * self.hist + self.smooth * hist
 
+    def accumulate(self, bgr) -> int:
+        """Add this frame's patch to the profile instead of replacing it.
+
+        learn() answers "what does the floor look like HERE, NOW",
+        which is the wrong question in a room with a window at one end.
+        Started facing the light it learns a bright reflective floor
+        and calls the shaded half an obstacle; started facing away it
+        does the reverse. Either way it can only drive in the direction
+        it happened to boot in.
+
+        Accumulating raw counts over many frames, from many headings,
+        asks instead what the floor looks like in this ROOM. The
+        histogram ends up covering every appearance the floor actually
+        has, because it was shown every one of them.
+
+        Counts are summed before normalising, deliberately: normalising
+        each frame first would let a patch of near-uniform floor —
+        which is most of them — carry the same weight as one spanning
+        a bright-to-dark gradient, and the gradient is the part worth
+        having.
+        """
+        x0, y0, x1, y1 = self.patch_box(bgr.shape)
+        hsv = self.hsv_of(bgr)[y0:y1, x0:x1]
+        if self.chosen is None:
+            sat = float(hsv[:, :, 1].mean())
+            self.chosen = "hs" if sat >= self.ACHROMATIC_S else "sv"
+            self.why = f"patch saturation {sat:.0f} across the corpus"
+        hist = cv2.calcHist([hsv], self.channels, None, self.bins, self.ranges)
+        self._raw = hist if getattr(self, "_raw", None) is None else self._raw + hist
+        self.frames_seen = getattr(self, "frames_seen", 0) + 1
+        return self.frames_seen
+
+    def finalise(self) -> None:
+        """Turn accumulated counts into the histogram mask() uses."""
+        if getattr(self, "_raw", None) is None:
+            raise ValueError("nothing accumulated")
+        hist = self._raw.copy()
+        cv2.normalize(hist, hist, 0, 255, cv2.NORM_MINMAX)
+        self.hist = hist
+
+    def save(self, path: str, **extra) -> None:
+        """Write the profile and the settings it only makes sense under.
+
+        The settings travel with it because a histogram built at one
+        bin count, channel pair or flatten sigma is meaningless read
+        back under another, and nothing about the numbers themselves
+        would reveal the mismatch.
+        """
+        np.savez(path, hist=self.hist, mode=self.chosen,
+                 bins=self.bins[0], flatten=self.flatten,
+                 frames=getattr(self, "frames_seen", 1), **extra)
+
+    @classmethod
+    def load(cls, path: str, smooth: float = 0.0):
+        d = np.load(path, allow_pickle=False)
+        m = cls(smooth=smooth, mode=str(d["mode"]),
+                bins=int(d["bins"]), flatten=float(d["flatten"]))
+        m.hist = d["hist"].astype(np.float32)
+        m.frames_seen = int(d["frames"])
+        m.why = (f"loaded from {path}: {m.frames_seen} frames, "
+                 f"{m.chosen}, bins {m.bins[0]}, flatten {m.flatten:.0f}")
+        return m
+
     def mask(self, bgr, threshold: int = 40, close_px: int = 11):
         """255 where the pixel looks like floor.
 
@@ -775,6 +838,10 @@ def add_perception_args(ap) -> None:
     ap.add_argument("--channels", default="auto", choices=("auto", "hs", "sv"),
                     help="which two HSV channels model the floor. auto picks sv on a "
                          "grey floor, where hue is noise, and hs where there is colour")
+    ap.add_argument("--floor-model", default=None, metavar="FILE.npz",
+                    help="load a profile built by floorprofile.py from a recorded "
+                         "session, instead of learning from one patch at startup. "
+                         "This is the fix for a room lit from one end")
     ap.add_argument("--adapt", type=float, default=0.0,
                     help="floor model blend rate, 0 learns once")
     ap.add_argument("--no-lock-exposure", action="store_true",
@@ -966,11 +1033,21 @@ def main() -> int:
     cam = Camera(lock_exposure=not args.no_lock_exposure, rotate=args.rotate,
                  mast=None if args.no_servo else car)
 
-    print("\nlearning the floor — keep a metre of clear ground ahead")
-    time.sleep(1.0)
-    floor = FloorModel(smooth=args.adapt, mode=args.channels, bins=args.bins,
-                       flatten=args.flatten)
-    floor.learn(shrink(cam.frame(), args.scale))
+    if args.floor_model:
+        # A profile built from a driven session already covers every
+        # heading in the room, so there is nothing to learn here and
+        # nothing to point at first.
+        floor = FloorModel.load(args.floor_model, smooth=args.adapt)
+        if (floor.bins[0], floor.flatten) != (args.bins, args.flatten):
+            print(f"  !! profile was built with bins {floor.bins[0]} flatten "
+                  f"{floor.flatten:.0f}, you passed bins {args.bins} flatten "
+                  f"{args.flatten:.0f} — using the profile's", file=sys.stderr)
+    else:
+        print("\nlearning the floor — keep a metre of clear ground ahead")
+        time.sleep(1.0)
+        floor = FloorModel(smooth=args.adapt, mode=args.channels, bins=args.bins,
+                           flatten=args.flatten)
+        floor.learn(shrink(cam.frame(), args.scale))
     print(f"learned: {getattr(floor, 'why', floor.chosen)}\n")
 
     # A cooldown longer than the arc pulse turns every pulse into a
