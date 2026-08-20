@@ -366,11 +366,14 @@ class Policy:
         "soft_back_left", "soft_back_right",
     ))
 
-    def __init__(self, go: float, turn_margin: float, stuck_after: float,
+    def __init__(self, go: float, commit: float, turn_margin: float, stuck_after: float,
                  reverse_for: float, soft_margin: float = 0.0,
                  back_below: float = 0.35, dodge_min: float = 0.5,
                  max_turn: float = 4.0, straighten_for: float = 1.0):
         self.go = go                      # centre clearance to keep going
+        # Above this the centre is not merely passable but plainly
+        # open, and nothing either side is worth turning for.
+        self.commit = commit
         self.turn_margin = turn_margin    # how much better a side must be
         self.stuck_after = stuck_after
         self.reverse_for = reverse_for
@@ -492,6 +495,23 @@ class Policy:
                          self._escape(self._dodge_side != "right", now))
 
     def _choose(self, left, centre, right, now) -> str:
+        # Plainly open ahead. Commit to it and stop looking sideways.
+        #
+        # Below this the drift rule is worth having: a side closing in
+        # is worth easing away from before it becomes a hard turn.
+        # Above it that same rule is what keeps the tank fiddling in a
+        # corner — both sides read as interesting, it corrects toward
+        # one, the correction changes the view, it corrects back, and
+        # it works its way around the room without ever crossing it.
+        #
+        # Going somewhere requires being willing to ignore a better
+        # option to either side. This is that willingness, expressed
+        # as a number.
+        if centre >= self.commit:
+            self._turning_since = None
+            self._dodge_side = None
+            return self._say("committed", "forward")
+
         if centre >= self.go:
             self._turning_since = None
             self._dodge_side = None
@@ -692,6 +712,11 @@ def add_perception_args(ap) -> None:
     default tuned in one place cannot quietly disagree with the
     same flag somewhere else.
     """
+    ap.add_argument("--commit-above", type=float, default=0.625,
+                    help="centre clearance, as a fraction of frame height, above "
+                         "which roam drives straight and ignores both sides "
+                         "entirely. Stops it grooming its way around a room "
+                         "instead of crossing it. 0.625 is 300px at 480 high")
     ap.add_argument("--go", type=float, default=0.45,
                     help="centre clearance to keep going, as a fraction of frame height")
     ap.add_argument("--threshold", type=int, default=40, help="floor match strictness 0-255")
@@ -788,6 +813,7 @@ def marks_for(args, h):
     """
     go_px = args.go * h
     return [
+        (getattr(args, "commit_above", 0.625) * h, "commit", (255, 255, 255)),
         (go_px, "go", (0, 255, 255)),
         (go_px * getattr(args, "dodge_min", 0.35), "dodge", (255, 160, 0)),
         (go_px * getattr(args, "back_below", 0.22), "back", (200, 0, 255)),
@@ -943,7 +969,8 @@ def main() -> int:
     go_px = args.go * h
     margin_px = args.turn_margin * h
 
-    policy = Policy(go_px, margin_px, args.stuck_after, args.reverse_for,
+    policy = Policy(go_px, args.commit_above * h, margin_px,
+                    args.stuck_after, args.reverse_for,
                     soft_margin=args.soft_margin * h, back_below=args.back_below,
                     dodge_min=args.dodge_min, max_turn=args.max_turn,
                     straighten_for=args.straighten_for)
