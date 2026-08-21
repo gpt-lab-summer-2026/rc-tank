@@ -360,7 +360,11 @@ def main() -> int:
             if cam is not None and floor is not None:
                 now = time.monotonic()
                 try:
-                    frame, mask, prof, regs = perceive(cam.frame(), floor, args)
+                    from roam import blocking_boxes
+                    blocks = (blocking_boxes(shown_dets, now - shown_at, args)
+                              if detector is not None else [])
+                    frame, mask, prof, regs = perceive(cam.frame(), floor, args,
+                                                       blocks)
                 except Exception:
                     frame = None
                 if frame is not None:
@@ -384,7 +388,8 @@ def main() -> int:
                                              f"L{L:.0f} C{C:.0f} R{R:.0f}",
                                              marks, dets=shown_dets,
                                              small_max=args.small_object,
-                                             det_age=now - shown_at))
+                                             det_age=now - shown_at,
+                                             blocking=blocks))
 
             for key in keys:
                 if key == "x":

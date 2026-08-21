@@ -727,7 +727,7 @@ class Smoother:
 
 
 def annotate(bgr, mask, prof, regs, move, marks=(), dets=(),
-             small_max: float = 1.0, det_age: float = 0.0):
+             small_max: float = 1.0, det_age: float = 0.0, blocking=()):
     """Draw what the policy is looking at, over the frame it looked at.
 
     marks are horizontal reference lines — the thresholds the numbers
@@ -774,14 +774,21 @@ def annotate(bgr, mask, prof, regs, move, marks=(), dets=(),
             out, f"{v:.0f}", (int(w * (i / 3 + 0.12)), 28),
             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
         )
+    blocking = {tuple(b) for b in blocking}
     for d in dets:
+        vetoing = tuple(d.box) in blocking
         reported = d.area_frac <= small_max
-        colour = (0, 140, 255) if reported else (130, 130, 130)
+        # Red for anything currently stopping the tank, so a box that
+        # merely got named is never mistaken for one that is steering.
+        colour = ((0, 0, 255) if vetoing
+                  else (0, 140, 255) if reported else (130, 130, 130))
         bx0, by0, bx1, by1 = d.box
         cv2.rectangle(out, (bx0, by0), (bx1, by1), colour, 2 if reported else 1)
 
         tag = f"{d.label} {d.confidence:.0%}"
-        if not reported:
+        if vetoing:
+            tag += "  BLOCKING"
+        elif not reported:
             tag += f"  {d.area_frac:.0%} of frame"
         (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
 
@@ -896,6 +903,21 @@ def add_detect_args(ap) -> None:
     ap.add_argument("--detect-threads", type=int, default=2,
                     help="cores the model may use. All four starves the control "
                          "loop, which is what this design exists to prevent")
+    ap.add_argument("--no-block-detections", action="store_true",
+                    help="report detections but do not let them stop the tank. "
+                         "Off by default: with --detect given, what the model "
+                         "sees blocks the path")
+    ap.add_argument("--block-conf", type=float, default=0.50,
+                    help="confidence a detection needs before it may block. "
+                         "Higher than the reporting threshold on purpose — a "
+                         "wrong report is noise, a wrong block is a stuck tank")
+    ap.add_argument("--block-min-area", type=float, default=0.02,
+                    help="detections smaller than this fraction of the frame are "
+                         "reported but driven past. A pen is not a reason to turn")
+    ap.add_argument("--block-age", type=float, default=1.5,
+                    help="seconds a detection keeps blocking after it was "
+                         "computed. Inference lags, and the tank has moved since, "
+                         "so an old box describes ground that is no longer there")
     ap.add_argument("--small-object", type=float, default=0.08,
                     help="while driving, only report things smaller than this "
                          "fraction of the frame. Bigger ones are the walls and "
@@ -937,17 +959,57 @@ def marks_for(args, h):
     ]
 
 
-def perceive(raw, floor, args):
+def block_out(mask, boxes):
+    """Punch detector boxes into the mask as not-floor.
+
+    After the morphology, not before: closing would eat a thin box and
+    opening would grow it, and neither is wanted on a region that is
+    already a definite answer rather than a noisy one.
+
+    The whole box is punched, not just where the object meets the
+    ground. It costs nothing — free_profile counts up from the bottom
+    and stops at the box's lower edge either way — and it makes the
+    blocked region obvious in the debug view.
+    """
+    out = mask.copy()
+    h, w = out.shape
+    for x0, y0, x1, y1 in boxes:
+        out[max(0, y0):min(h, y1), max(0, x0):min(w, x1)] = 0
+    return out
+
+
+def perceive(raw, floor, args, blocks=()):
     """Frame in, everything the policy reads out.
 
     Shared so teleop shows exactly what roam would decide from, rather
     than an approximation of it that drifts the first time either is
     tuned.
+
+    blocks are detector boxes that veto the floor model. The two
+    disagree in opposite directions and that is the point: a histogram
+    of a pale floor cannot separate an obstacle whose brightness sits
+    inside the floor's own range — measured at a 71% ceiling across
+    288 configurations — while a detector does not care about
+    brightness at all. Neither is trusted to find everything; the
+    detector is only ever allowed to ADD an obstacle, never to clear
+    one, so a missed detection leaves the floor model exactly as it
+    was rather than overriding it.
     """
     frame = shrink(raw, args.scale)
     mask = floor.mask(frame, args.threshold, args.close, args.horizon)
+    if blocks:
+        mask = block_out(mask, blocks)
     prof = free_profile(mask, args.min_obstacle)
     return frame, mask, prof, regions(prof, args.percentile)
+
+
+def blocking_boxes(dets, age, args):
+    """Which detections are currently allowed to stop the tank."""
+    if getattr(args, "no_block_detections", False) or age > args.block_age:
+        return []
+    return [d.box for d in dets
+            if d.confidence >= args.block_conf
+            and d.area_frac >= args.block_min_area]
 
 
 
@@ -1192,7 +1254,9 @@ def main() -> int:
                 continue
             next_tick = max(now + period, next_tick + period)
 
-            frame, mask, prof, regs = perceive(cam.frame(), floor, args)
+            blocks = blocking_boxes(shown_dets, now - shown_at, args) \
+                if detector is not None else []
+            frame, mask, prof, regs = perceive(cam.frame(), floor, args, blocks)
 
             move = smoother.update(policy.decide(*regs, now), now)
             decision = tracks_for(move, now, soft)
@@ -1302,7 +1366,7 @@ def main() -> int:
             if want_file or want_view:
                 shown = annotate(frame, mask, prof, regs, move, marks,
                                  dets=shown_dets, small_max=args.small_object,
-                                 det_age=now - shown_at)
+                                 det_age=now - shown_at, blocking=blocks)
                 if want_file:
                     last_debug = now
                     cv2.imwrite(args.debug_image, shown)
