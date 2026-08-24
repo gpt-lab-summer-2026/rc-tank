@@ -1,0 +1,412 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>rc-tank</title>
+<style>
+  :root{
+    --bg:#0e1013; --panel:#171a1f; --line:#262b33; --ink:#d7dce3;
+    --dim:#828b98; --go:#3ddc84; --warn:#ffb020; --stop:#ff4d4d;
+    --accent:#4da3ff;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  body{padding:10px;max-width:1180px;margin:0 auto;
+    -webkit-user-select:none;user-select:none;touch-action:manipulation}
+  h2{font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--dim);margin:0 0 8px;font-weight:600}
+  .panel{background:var(--panel);border:1px solid var(--line);
+    border-radius:10px;padding:12px;margin-bottom:10px}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .grow{flex:1 1 320px;min-width:0}
+
+  /* ---- mode ---- */
+  #modes{display:flex;gap:8px;flex:1 1 auto}
+  #modes button{flex:1;padding:14px 8px;font:600 14px/1 inherit;
+    letter-spacing:.08em;text-transform:uppercase;color:var(--ink);
+    background:#1e232b;border:1px solid var(--line);border-radius:8px;
+    cursor:pointer}
+  #modes button.on{color:#06210f;background:var(--go);border-color:var(--go)}
+  #modes button.arm{color:#2a1b00;background:var(--warn);border-color:var(--warn);
+    animation:pulse .9s ease-in-out infinite}
+  #modes button[data-mode=stop].on{color:#2a0000;background:var(--stop);
+    border-color:var(--stop)}
+  @keyframes pulse{50%{opacity:.55}}
+
+  /* ---- view ---- */
+  #view{position:relative;background:#000;border-radius:8px;overflow:hidden;
+    aspect-ratio:4/3}
+  #view img{width:100%;height:100%;object-fit:contain;display:block}
+  #banner{position:absolute;inset:auto 0 0 0;padding:6px 10px;font-size:12px;
+    background:#000a;backdrop-filter:blur(3px)}
+  #roamflag{position:absolute;top:8px;left:8px;padding:4px 10px;border-radius:6px;
+    font:600 11px/1 inherit;letter-spacing:.1em;background:var(--go);
+    color:#06210f;display:none}
+  body[data-mode=roam] #roamflag{display:block}
+  body[data-mode=roam] #view{outline:2px solid var(--go)}
+  body[data-mode=manual] #view{outline:2px solid var(--accent)}
+
+  /* ---- stats ---- */
+  table.stat{width:100%;border-collapse:collapse}
+  table.stat td{padding:3px 0;vertical-align:baseline}
+  table.stat td:first-child{color:var(--dim);width:9em}
+  .big{font-size:20px;font-weight:600}
+  .bar{height:6px;background:#000;border-radius:3px;overflow:hidden;margin-top:3px}
+  .bar i{display:block;height:100%;background:var(--accent)}
+
+  /* ---- pad ---- */
+  #pad{display:grid;gap:8px;grid-template-columns:repeat(3,1fr);max-width:420px;
+    margin:0 auto}
+  #pad button{padding:20px 6px;font:600 13px/1.2 inherit;color:var(--ink);
+    background:#1e232b;border:1px solid var(--line);border-radius:10px;
+    cursor:pointer;touch-action:none}
+  #pad button small{display:block;color:var(--dim);font-weight:400;font-size:11px;
+    margin-top:4px}
+  #pad button.live{background:var(--accent);color:#04182e;border-color:var(--accent)}
+  #pad button:disabled{opacity:.32;cursor:not-allowed}
+  #estop{grid-column:1/-1;background:#3a1414;border-color:#5e1f1f;color:#ffb3b3}
+  #estop:hover{background:var(--stop);color:#2a0000}
+
+  /* ---- config ---- */
+  details{border-top:1px solid var(--line);padding-top:10px}
+  summary{cursor:pointer;color:var(--dim);font-size:12px;letter-spacing:.14em;
+    text-transform:uppercase}
+  .fields{display:grid;gap:8px 14px;
+    grid-template-columns:repeat(auto-fill,minmax(240px,1fr));margin-top:12px}
+  .f{display:flex;flex-direction:column;gap:3px;min-width:0}
+  .f label{font-size:12px;color:var(--ink);display:flex;gap:6px;align-items:center}
+  .f code{color:var(--dim);font-size:11px}
+  .f input[type=text],.f select{background:#0b0d10;color:var(--ink);
+    border:1px solid var(--line);border-radius:6px;padding:7px 8px;
+    font:13px/1 inherit;min-width:0;-webkit-user-select:text;user-select:text}
+  .f input:focus,.f select:focus{outline:1px solid var(--accent);border-color:var(--accent)}
+  .f .hint{font-size:11px;color:var(--dim);
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .f.dirty input,.f.dirty select{border-color:var(--warn)}
+  .tag{font-size:10px;padding:1px 5px;border-radius:4px;background:#2a2f38;
+    color:var(--dim)}
+  .tag.restart{background:#3a2a10;color:var(--warn)}
+  .act{padding:9px 16px;font:600 13px/1 inherit;border-radius:8px;cursor:pointer;
+    background:#1e232b;color:var(--ink);border:1px solid var(--line)}
+  .act.primary{background:var(--accent);color:#04182e;border-color:var(--accent)}
+  #notice{min-height:1.4em;color:var(--warn);font-size:12px}
+  .off{color:var(--dim)}
+</style>
+
+<div class="panel row">
+  <div id="modes">
+    <button data-mode="stop" class="on">Stop</button>
+    <button data-mode="manual">Manual</button>
+    <button data-mode="roam">Roam</button>
+  </div>
+</div>
+
+<div class="row">
+  <div class="grow panel" style="padding:0;overflow:hidden">
+    <div id="view">
+      <img src="/stream.mjpg" alt="live view">
+      <div id="roamflag">ROAMING</div>
+      <div id="banner">green floor &middot; red column stops &middot; cyan patch</div>
+    </div>
+  </div>
+
+  <div class="panel" style="flex:1 1 260px">
+    <h2>State</h2>
+    <table class="stat">
+      <tr><td>move</td><td class="big" id="s-move">&mdash;</td></tr>
+      <tr><td>reason</td><td id="s-reason">&mdash;</td></tr>
+      <tr><td>clear L/C/R</td><td id="s-regs">&mdash;</td></tr>
+      <tr><td>go above</td><td id="s-go">&mdash;</td></tr>
+      <tr><td>relays</td><td id="s-relays">&mdash;</td></tr>
+      <tr><td>loop</td><td id="s-fps">&mdash;</td></tr>
+      <tr><td>reversals</td><td id="s-rev">0</td></tr>
+      <tr><td>bridge resets</td><td id="s-resets">0</td></tr>
+      <tr><td>seen</td><td id="s-det" class="off">&mdash;</td></tr>
+      <tr><td>lease</td><td><span id="s-lease" class="off">idle</span>
+        <div class="bar"><i id="s-leasebar" style="width:0"></i></div></td></tr>
+    </table>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Drive &mdash; hold a control, release to stop</h2>
+  <div id="pad">
+    <button data-move="soft_arc_left">soft&nbsp;&larr;<small>Q</small></button>
+    <button data-move="forward">forward<small>W</small></button>
+    <button data-move="soft_arc_right">soft&nbsp;&rarr;<small>E</small></button>
+    <button data-move="arc_left">arc&nbsp;&larr;<small>A</small></button>
+    <button data-move="reverse">reverse<small>S</small></button>
+    <button data-move="arc_right">arc&nbsp;&rarr;<small>D</small></button>
+    <button id="estop">STOP EVERYTHING<small>space</small></button>
+  </div>
+</div>
+
+<div class="panel">
+  <details>
+    <summary>Configuration</summary>
+    <div class="row" style="margin-top:12px">
+      <button class="act primary" id="apply">Apply</button>
+      <button class="act" id="relearn">Relearn floor</button>
+      <button class="act" id="revert">Revert</button>
+      <span id="notice"></span>
+    </div>
+    <div class="fields" id="fields"></div>
+  </details>
+</div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const post = (path, body) =>
+  fetch(path, {method:"POST", headers:{"Content-Type":"application/json"},
+               body: JSON.stringify(body||{})}).then(r => r.json()).catch(()=>null);
+
+let mode = "stop";
+let armed = null;            // roam selected but not yet started
+let armTimer = null;
+let held = null;             // move currently being held
+let renewTimer = null;
+let leaseMax = 0.6;
+
+/* ---------------------------------------------------------- modes */
+
+function paintMode(){
+  document.body.dataset.mode = mode;
+  document.querySelectorAll("#modes button").forEach(b => {
+    b.classList.toggle("on", b.dataset.mode === mode);
+    b.classList.toggle("arm", b.dataset.mode === armed);
+    if (b.dataset.mode === armed) b.textContent = "Press again to roam";
+    else b.textContent = b.dataset.mode[0].toUpperCase() + b.dataset.mode.slice(1);
+  });
+  document.querySelectorAll("#pad button[data-move]")
+          .forEach(b => b.disabled = mode !== "manual");
+}
+
+document.querySelectorAll("#modes button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const want = btn.dataset.mode;
+
+    // Roaming takes two presses. The buttons are adjacent on a phone
+    // and the difference between them is a tank crossing the room.
+    if (want === "roam" && armed !== "roam"){
+      armed = "roam";
+      paintMode();
+      // Arming lapses. Otherwise a button armed and forgotten about
+      // stays armed, and the next press — minutes later, by whoever
+      // picks the phone up — starts the tank with one touch, which is
+      // the thing the second press exists to prevent.
+      clearTimeout(armTimer);
+      armTimer = setTimeout(() => { armed = null; paintMode(); }, 5000);
+      return;
+    }
+
+    clearTimeout(armTimer);
+    armed = null;
+    releaseHeld();
+    mode = want;
+    paintMode();
+    post("/api/mode", {mode: want});
+  });
+});
+
+/* ------------------------------------------------- hold to drive */
+
+function startHold(move){
+  if (mode !== "manual" || held === move) return;
+  held = move;
+  paintHeld();
+  post("/api/hold", {move});
+  clearInterval(renewTimer);
+  // Renew well inside the lease so one dropped request does not stall
+  // the tank, but not so often that a phone hammers the loop.
+  renewTimer = setInterval(() => post("/api/hold", {move}), leaseMax * 1000 / 3);
+}
+
+function releaseHeld(){
+  clearInterval(renewTimer); renewTimer = null;
+  if (held === null) return;
+  held = null;
+  paintHeld();
+  post("/api/release", {});
+}
+
+function paintHeld(){
+  document.querySelectorAll("#pad button[data-move]")
+    .forEach(b => b.classList.toggle("live", b.dataset.move === held));
+}
+
+document.querySelectorAll("#pad button[data-move]").forEach(b => {
+  const move = b.dataset.move;
+  b.addEventListener("pointerdown", e => {
+    e.preventDefault();
+    b.setPointerCapture(e.pointerId);
+    startHold(move);
+  });
+  ["pointerup","pointercancel","pointerleave"].forEach(ev =>
+    b.addEventListener(ev, releaseHeld));
+});
+
+const KEYS = {KeyW:"forward", KeyS:"reverse", KeyA:"arc_left", KeyD:"arc_right",
+              KeyQ:"soft_arc_left", KeyE:"soft_arc_right"};
+
+addEventListener("keydown", e => {
+  if (e.target.matches("input,select,textarea")) return;
+  if (e.code === "Space"){ e.preventDefault(); estop(); return; }
+  // repeat is ignored: a browser reports the release, so unlike the
+  // terminal there is nothing to infer from key repeat.
+  if (e.repeat || !KEYS[e.code]) return;
+  e.preventDefault();
+  startHold(KEYS[e.code]);
+});
+addEventListener("keyup", e => { if (KEYS[e.code]) releaseHeld(); });
+
+// Anything that means the operator may no longer be watching.
+addEventListener("blur", releaseHeld);
+addEventListener("pointercancel", releaseHeld);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) releaseHeld();
+});
+
+function estop(){
+  armed = null;
+  releaseHeld();
+  mode = "stop";
+  paintMode();
+  post("/api/mode", {mode:"stop"});
+}
+$("#estop").addEventListener("click", estop);
+
+/* ------------------------------------------------------- polling */
+
+function paintState(s){
+  if (!s) { $("#s-move").textContent = "no link"; return; }
+  if (s.mode !== mode && held === null){ mode = s.mode; paintMode(); }
+
+  $("#s-move").textContent   = s.move;
+  $("#s-reason").textContent = s.reason;
+  $("#s-reason").style.color = /EXPIRED|boxed|no-progress/.test(s.reason)
+                               ? "var(--warn)" : "";
+  $("#s-regs").textContent   = s.regs.join("  /  ");
+  $("#s-go").textContent     = s.go_px + " px";
+  $("#s-relays").textContent = s.relays || (s.driving ? "—" : "dry run");
+  $("#s-fps").textContent    = s.loop_fps + " Hz" + (s.held ? "   HELD" : "");
+  $("#s-rev").textContent    = s.reversals;
+  $("#s-resets").textContent = s.resets;
+  $("#s-resets").style.color = s.resets ? "var(--stop)" : "";
+  $("#s-det").textContent    = s.detections.length ? s.detections.join(", ") : "—";
+  $("#s-det").className      = s.detections.length ? "" : "off";
+
+  const pct = Math.min(1, s.lease / leaseMax);
+  $("#s-leasebar").style.width = (pct*100).toFixed(0) + "%";
+  $("#s-lease").textContent = s.lease > 0 ? s.lease.toFixed(1)+"s left" : "idle";
+  $("#s-lease").className = s.lease > 0 ? "" : "off";
+
+  if (s.notice) $("#notice").textContent = s.notice;
+}
+
+setInterval(() => fetch("/api/state").then(r=>r.json()).then(paintState)
+                    .catch(()=>paintState(null)), 250);
+
+/* -------------------------------------------------------- config */
+
+let fields = [];
+
+function render(){
+  const box = $("#fields");
+  box.innerHTML = "";
+  let group = null;
+  for (const f of fields){
+    if (f.group !== group){
+      group = f.group;
+      const h = document.createElement("h2");
+      h.textContent = group;
+      h.style.gridColumn = "1/-1";
+      h.style.marginTop = "6px";
+      box.appendChild(h);
+    }
+    const d = document.createElement("div");
+    d.className = "f";
+    const id = "c_" + f.dest;
+
+    const lab = document.createElement("label");
+    lab.htmlFor = id;
+    lab.innerHTML = `<code>${f.flag}</code>` +
+      (f.live ? "" : ` <span class="tag restart">restart</span>`) +
+      (f.relearn ? ` <span class="tag">relearn</span>` : "");
+    d.appendChild(lab);
+
+    let input;
+    if (f.choices){
+      input = document.createElement("select");
+      for (const c of f.choices){
+        const o = document.createElement("option");
+        o.value = o.textContent = c;
+        input.appendChild(o);
+      }
+      input.value = f.value;
+    } else if (f.kind === "bool"){
+      input = document.createElement("select");
+      for (const c of ["false","true"]){
+        const o = document.createElement("option");
+        o.value = o.textContent = c;
+        input.appendChild(o);
+      }
+      input.value = String(!!f.value);
+    } else {
+      input = document.createElement("input");
+      input.type = "text";
+      input.value = f.value;
+      input.spellcheck = false;
+      input.autocapitalize = "off";
+      input.autocomplete = "off";
+    }
+    input.id = id;
+    input.dataset.dest = f.dest;
+    input.dataset.orig = input.value;
+    input.addEventListener("input", () =>
+      d.classList.toggle("dirty", input.value !== input.dataset.orig));
+    d.appendChild(input);
+
+    if (f.help){
+      const h = document.createElement("div");
+      h.className = "hint";
+      h.textContent = f.help;
+      d.appendChild(h);
+    }
+    box.appendChild(d);
+  }
+}
+
+fetch("/api/config").then(r=>r.json()).then(j => {
+  fields = j.fields;
+  const hold = fields.find(f => f.dest === "manual_hold");
+  if (hold) leaseMax = parseFloat(hold.value) || 0.6;
+  render();
+});
+
+$("#apply").addEventListener("click", () => {
+  const values = {};
+  document.querySelectorAll("#fields [data-dest]").forEach(i => {
+    values[i.dataset.dest] = i.value;
+    i.dataset.orig = i.value;
+    i.parentElement.classList.remove("dirty");
+  });
+  $("#notice").textContent = "applying…";
+  post("/api/config", {values});
+});
+
+$("#revert").addEventListener("click", () => {
+  document.querySelectorAll("#fields [data-dest]").forEach(i => {
+    i.value = i.dataset.orig;
+    i.parentElement.classList.remove("dirty");
+  });
+  $("#notice").textContent = "";
+});
+
+$("#relearn").addEventListener("click", () => {
+  $("#notice").textContent = "relearning — keep clear floor ahead…";
+  post("/api/relearn", {});
+});
+
+paintMode();
+</script>
