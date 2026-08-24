@@ -143,8 +143,20 @@ def main() -> int:
     model.finalise()
 
     populated = int((model.hist > 0).sum())
+    covered = populated / model.hist.size
     print(f"\nprofile from {used} frames: {model.why}")
-    print(f"  {populated}/{model.hist.size} bins populated")
+    print(f"  {populated}/{model.hist.size} bins populated "
+          f"({covered*100:.0f}% of the colour space)")
+    if covered > 0.35:
+        print(f"\n  !! THIS PROFILE IS TOO BROAD. It says 'floor' to {covered*100:.0f}%")
+        print( "     of every colour there is, so it will accept walls, furniture")
+        print( "     and obstacles as readily as the floor.")
+        print( "     A profile is meant to describe ONE floor under the lighting")
+        print( "     of ONE room. Pooling sessions from different days, rooms or")
+        print( "     white balance settings does not make it more general, it")
+        print( "     makes it meaningless. Build from a single recent session in")
+        print( "     the room you are driving, and use --every 10 — frames three")
+        print( "     apart add nothing a histogram can use.")
 
     # The number that says whether this was worth doing: how much of
     # the recorded floor each model accepts, measured over the SAME
@@ -165,10 +177,34 @@ def main() -> int:
         scores["this profile"].append(
             (model.mask(img, args.threshold, args.close) > 0).mean())
 
-    print(f"\n  floor accepted across {len(sample)} frames of the session:")
+    # Split by the horizon. Everything above it is wall, furniture and
+    # room — never driveable — so what the profile accepts up there is
+    # a direct measure of how much it over-accepts. A good profile is
+    # high below and low above; one that is high in both has stopped
+    # discriminating and is only agreeing with everything.
+    hz = args.horizon if args.horizon > 0 else 0.30
+    above = {k: [] for k in scores}
+    for p in sample:
+        img = cv2.imread(str(p))
+        if img is None:
+            continue
+        img = shrink(cv2.resize(img, WORKING, interpolation=cv2.INTER_AREA), args.scale)
+        cut = int(img.shape[0] * hz)
+        above["one patch (what roam does now)"].append(
+            (single.mask(img, args.threshold, args.close)[:cut] > 0).mean())
+        above["this profile"].append(
+            (model.mask(img, args.threshold, args.close)[:cut] > 0).mean())
+
+    print(f"\n  accepted across {len(sample)} frames of the session:")
+    print(f"    {'':<32}{'whole frame':>14}{'ABOVE horizon':>16}")
     for name, vals in scores.items():
-        v = np.array(vals)
-        print(f"    {name:<32} mean {v.mean()*100:5.1f}%   worst frame {v.min()*100:5.1f}%")
+        v = np.array(vals); a = np.array(above[name])
+        print(f"    {name:<32}{v.mean()*100:>13.1f}%{a.mean()*100:>15.1f}%")
+    bad = np.array(above["this profile"]).mean()
+    if bad > 0.35:
+        print(f"\n  !! {bad*100:.0f}% of what is ABOVE the horizon is being called")
+        print( "     floor. None of it is. Raise --threshold, cut --bins, or")
+        print( "     build from fewer and more similar frames.")
     print("\n  The worst frame is the one that matters. That is the heading")
     print("  roam would refuse to drive in.")
 
