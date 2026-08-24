@@ -1145,10 +1145,25 @@ def main() -> int:
         # heading in the room, so there is nothing to learn here and
         # nothing to point at first.
         floor = FloorModel.load(args.floor_model, smooth=args.adapt)
-        if (floor.bins[0], floor.flatten) != (args.bins, args.flatten):
-            print(f"  !! profile was built with bins {floor.bins[0]} flatten "
-                  f"{floor.flatten:.0f}, you passed bins {args.bins} flatten "
-                  f"{args.flatten:.0f} — using the profile's", file=sys.stderr)
+        # These three live in the profile, not on the command line. A
+        # histogram is only meaningful under the settings it was built
+        # with, so passing different ones cannot work — but passing
+        # them and having them quietly ignored is worse than either,
+        # because it looks like tuning that does nothing.
+        clash = [f"--bins {args.bins} (profile has {floor.bins[0]})"
+                 if floor.bins[0] != args.bins else "",
+                 f"--flatten {args.flatten:.0f} (profile has {floor.flatten:.0f})"
+                 if floor.flatten != args.flatten else "",
+                 f"--channels {args.channels} (profile has {floor.chosen})"
+                 if args.channels != "auto" and args.channels != floor.chosen else ""]
+        clash = [c for c in clash if c]
+        if clash:
+            print("\n  !! THESE FLAGS ARE BEING IGNORED, the profile decides them:",
+                  file=sys.stderr)
+            for c in clash:
+                print(f"       {c}", file=sys.stderr)
+            print("     Rebuild with floorprofile.py to change them, or drop "
+                  "--floor-model.\n", file=sys.stderr)
     else:
         print("\nlearning the floor — keep a metre of clear ground ahead")
         time.sleep(1.0)
@@ -1185,6 +1200,10 @@ def main() -> int:
                                     args.threshold, args.close),
                          args.min_obstacle)
     reach = float(probe.max())
+    print(f"effective perception: channels {floor.chosen}  bins {floor.bins[0]}  "
+          f"flatten {floor.flatten:.0f}  threshold {args.threshold}  "
+          f"close {args.close}  min-obstacle {args.min_obstacle}  "
+          f"horizon {args.horizon:.2f}")
     print(f"most clearance any column can show right now: {reach:.0f}px "
           f"({reach / h:.2f} of frame)")
     for name, want in (("--go", go_px),

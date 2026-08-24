@@ -81,7 +81,9 @@ def forward_frames(session: Path, every: int = 1):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("sessions", nargs="+", help="dataset/session_* directories")
+    ap.add_argument("sessions", nargs="*", help="dataset/session_* directories")
+    ap.add_argument("--inspect", default=None, metavar="FILE.npz",
+                    help="print what settings a profile was built with, and stop")
     ap.add_argument("--out", default="floor.npz", help="where to write the profile")
     ap.add_argument("--every", type=int, default=1,
                     help="use every Nth forward frame; consecutive frames are "
@@ -90,6 +92,28 @@ def main() -> int:
                     help="use every frame, not only ones recorded going forward")
     add_perception_args(ap)
     args = ap.parse_args()
+
+    if args.inspect:
+        d = np.load(args.inspect, allow_pickle=False)
+        hist = d["hist"]
+        print(f"\n{args.inspect}")
+        print(f"  built from     {int(d['frames'])} frames")
+        print(f"  channels       {str(d['mode'])}")
+        print(f"  bins           {int(d['bins'])}")
+        print(f"  flatten        {float(d['flatten']):.0f}")
+        for k in ("threshold", "close", "scale"):
+            if k in d:
+                print(f"  {k:<14} {float(d[k]):g}   (recorded, not enforced)")
+        print(f"  bins populated {int((hist > 0).sum())}/{hist.size}")
+        print("\n  roam.py uses the channels, bins and flatten above and IGNORES")
+        print("  the ones you pass on the command line. Rebuild the profile to")
+        print("  change them.\n")
+        return 0
+
+    if not args.sessions:
+        print("give at least one session directory, or --inspect a profile",
+              file=sys.stderr)
+        return 1
 
     paths = []
     for d in args.sessions:
