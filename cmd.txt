@@ -1,4 +1,4 @@
-python roam.py --debug-image roam.jpg --threshold 14 --min-obstacle 16 --close 20 --go 0.45 --bins 12 --min-interval 0.6 --stream 8080 --flatten 75 --detect yolo11n.onnx --dry-run --floor-model floor.npz
+python roam.py --debug-image roam.jpg --threshold 14 --min-obstacle 16 --close 20 --go 0.62 --commit-above 0.68 --even-above 0.65 --bins 12 --min-interval 0.2 --stream 8080 --flatten 75 --detect yolo11n.onnx --floor-model floor.npz --detect-every 1.5 --window 3 --dry-run 
 
 ssh -N -L 8080:localhost:8080 kitchen-helper@rover.local
 

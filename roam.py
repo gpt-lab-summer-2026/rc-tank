@@ -727,7 +727,8 @@ class Smoother:
 
 
 def annotate(bgr, mask, prof, regs, move, marks=(), dets=(),
-             small_max: float = 1.0, det_age: float = 0.0, blocking=()):
+             small_max: float = 1.0, det_age: float = 0.0, blocking=(),
+             reasons=None):
     """Draw what the policy is looking at, over the frame it looked at.
 
     marks are horizontal reference lines — the thresholds the numbers
@@ -788,6 +789,8 @@ def annotate(bgr, mask, prof, regs, move, marks=(), dets=(),
         tag = f"{d.label} {d.confidence:.0%}"
         if vetoing:
             tag += "  BLOCKING"
+        elif reasons and reasons.get(tuple(d.box)):
+            tag += f"  passed: {reasons[tuple(d.box)]}"
         elif not reported:
             tag += f"  {d.area_frac:.0%} of frame"
         (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
@@ -1003,13 +1006,28 @@ def perceive(raw, floor, args, blocks=()):
     return frame, mask, prof, regions(prof, args.percentile)
 
 
+def why_blocked(d, age, args) -> str:
+    """Empty if this detection blocks, otherwise the gate that stopped it.
+
+    Worth reporting rather than inferring. Confidence is drawn rounded,
+    so a detection at 0.4996 prints as "50%" and still fails a 0.50
+    gate — which looks like a bug and is not one. Saying which gate
+    rejected it turns that from a mystery into a number to change.
+    """
+    if getattr(args, "no_block_detections", False):
+        return "blocking off"
+    if age > args.block_age:
+        return f"stale {age:.1f}s"
+    if d.confidence < args.block_conf:
+        return f"conf {d.confidence:.2f}<{args.block_conf:.2f}"
+    if d.area_frac < args.block_min_area:
+        return f"area {d.area_frac:.1%}<{args.block_min_area:.1%}"
+    return ""
+
+
 def blocking_boxes(dets, age, args):
     """Which detections are currently allowed to stop the tank."""
-    if getattr(args, "no_block_detections", False) or age > args.block_age:
-        return []
-    return [d.box for d in dets
-            if d.confidence >= args.block_conf
-            and d.area_frac >= args.block_min_area]
+    return [d.box for d in dets if not why_blocked(d, age, args)]
 
 
 
@@ -1254,9 +1272,35 @@ def main() -> int:
                 continue
             next_tick = max(now + period, next_tick + period)
 
+            # Drain the detector BEFORE deciding anything, so a box that
+            # has just arrived blocks on this tick rather than the next
+            # one and the debug view agrees with the mask. Draining
+            # after meant a fresh detection was drawn as harmless while
+            # already being one tick away from stopping the tank.
+            if detector is not None:
+                for found in detector.poll():
+                    floor_dets = [d for d in found if d.context == "floor"]
+                    shown_dets, shown_at = floor_dets, now
+                    small = [d for d in floor_dets
+                             if d.area_frac <= args.small_object]
+                    for d in reporter.fresh(small, now):
+                        say(f"  saw {d.label} ({d.confidence:.0%}) on the floor"
+                            f"  [{detector.last_ms:.0f} ms]")
+                # Expire them rather than leaving a box hanging over
+                # ground the tank drove past ten seconds ago.
+                if shown_dets and now - shown_at > max(2.0, args.detect_every * 2):
+                    shown_dets = []
+
             blocks = blocking_boxes(shown_dets, now - shown_at, args) \
                 if detector is not None else []
             frame, mask, prof, regs = perceive(cam.frame(), floor, args, blocks)
+
+            # Offer the frame we just decided from. Submitting never
+            # blocks; a frame arriving while the model is busy replaces
+            # the one already waiting.
+            if detector is not None and now - last_detect > args.detect_every:
+                last_detect = now
+                detector.submit(frame, "floor")
 
             move = smoother.update(policy.decide(*regs, now), now)
             decision = tracks_for(move, now, soft)
@@ -1337,27 +1381,6 @@ def main() -> int:
             )
             sys.stdout.flush()
 
-            # PATH 1. Offer the driving view to the detector and print
-            # anything small enough to be a thing ON the floor rather
-            # than a wall. Submitting never blocks; a frame arriving
-            # while the model is busy replaces the waiting one.
-            if detector is not None:
-                if now - last_detect > args.detect_every:
-                    last_detect = now
-                    detector.submit(frame, "floor")
-                for found in detector.poll():
-                    floor_dets = [d for d in found if d.context == "floor"]
-                    shown_dets, shown_at = floor_dets, now
-                    small = [d for d in floor_dets
-                             if d.area_frac <= args.small_object]
-                    for d in reporter.fresh(small, now):
-                        say(f"  saw {d.label} ({d.confidence:.0%}) on the floor"
-                            f"  [{detector.last_ms:.0f} ms]")
-
-                # Expire them rather than leaving a box hanging over
-                # ground the tank drove past ten seconds ago.
-                if shown_dets and now - shown_at > max(2.0, args.detect_every * 2):
-                    shown_dets = []
 
             # One annotate() serves both the file and the stream, since
             # drawing it twice would double the cost for no gain.
@@ -1366,7 +1389,10 @@ def main() -> int:
             if want_file or want_view:
                 shown = annotate(frame, mask, prof, regs, move, marks,
                                  dets=shown_dets, small_max=args.small_object,
-                                 det_age=now - shown_at, blocking=blocks)
+                                 det_age=now - shown_at, blocking=blocks,
+                                 reasons={tuple(d.box): why_blocked(
+                                     d, now - shown_at, args)
+                                     for d in shown_dets})
                 if want_file:
                     last_debug = now
                     cv2.imwrite(args.debug_image, shown)
