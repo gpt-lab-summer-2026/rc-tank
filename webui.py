@@ -276,6 +276,37 @@ class Controller:
             self.manual_until = time.monotonic() + self.args.manual_hold
         return True
 
+    MAST_STEP = 5
+
+    def mast(self, action) -> dict:
+        """Aim the camera. Never touches the tracks.
+
+        Allowed in every mode including roam, deliberately: the mast
+        angle is the one perception setting that cannot be judged from
+        a number, and having to stop roaming to correct it is how it
+        stays wrong.
+        """
+        if self.car is None:
+            return {"ok": False, "why": "no bridge"}
+        try:
+            if action == "up":
+                self.car.camera_up(settle=0.0)
+            elif action == "limp":
+                self.car.mast(-1)
+            elif action in ("raise", "lower"):
+                self.car.mast_nudge(self.MAST_STEP if action == "raise"
+                                    else -self.MAST_STEP)
+            else:
+                return {"ok": False, "why": f"unknown action {action!r}"}
+        except BridgeError as e:
+            return {"ok": False, "why": str(e)}
+        angle = self.car.mast_angle
+        limp = angle is None or angle < 0
+        self.notice = "camera limp" if limp else f"camera {angle} deg"
+        # None, matching state(), so the page has one thing to test for
+        # rather than two spellings of the same condition.
+        return {"ok": True, "mast": None if limp else angle}
+
     def release(self) -> None:
         with self.lock:
             self.manual_move = None
@@ -412,6 +443,8 @@ class Controller:
             "reversals": getattr(self.policy, "reversals", 0),
             "resets": getattr(car, "resets", 0) if car else 0,
             "held": bool(car and car.last_command_held),
+            "mast": (car.mast_angle if car and car.mast_angle is not None
+                     and car.mast_angle >= 0 else None),
             "notice": notice,
             **self.stat,
         }
@@ -554,6 +587,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/hold":
             ok = self.ctl.hold(body.get("move", "stop"))
             self._json({"ok": ok, **self.ctl.state()})
+            return
+
+        if self.path == "/api/mast":
+            self._json(self.ctl.mast(body.get("action", "")))
             return
 
         if self.path == "/api/release":

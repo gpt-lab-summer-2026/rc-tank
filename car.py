@@ -706,6 +706,25 @@ class Car:
         time.sleep(settle)
         return reply
 
+    def mast_nudge(self, delta: int) -> int:
+        """Move the mast by delta degrees. Returns where it ended up.
+
+        Nudging from limp, or from never-commanded, starts at MAST_UP.
+        That is the driving position and the only angle anyone nudges
+        away from in practice, so it is the one worth resuming from
+        rather than swinging to an end stop first.
+
+        Shared rather than reimplemented per program: the clamp and the
+        limp case are exactly the sort of thing that ends up subtly
+        different in three places.
+        """
+        base = self.mast_angle
+        if base is None or base < 0:
+            base = self.MAST_UP
+        angle = max(0, min(180, int(base) + int(delta)))
+        self.mast(angle)
+        return angle
+
     def camera_survey(self, settle: float = 0.8) -> str:
         """Point the mast at the room. Only meaningful while stopped."""
         return self.mast_hold(self.MAST_SURVEY, settle)

@@ -39,8 +39,12 @@ is the reference patch.
 from __future__ import annotations
 
 import argparse
+import os
+import select
 import sys
+import termios
 import time
+import tty
 from collections import Counter, deque
 
 import cv2
@@ -962,6 +966,51 @@ def marks_for(args, h):
     ]
 
 
+class Keys:
+    """Non-blocking keyboard input, when there is a keyboard.
+
+    roam usually runs with nothing watching stdin — piped over ssh,
+    started from a service, driven by the web page. Putting a
+    non-terminal into cbreak raises, and a control loop is the wrong
+    place to find that out, so this degrades to reading nothing rather
+    than refusing to start.
+    """
+
+    MAST_STEP = 5
+
+    def __init__(self):
+        self.fd = None
+        self.saved = None
+        try:
+            if sys.stdin.isatty():
+                self.fd = sys.stdin.fileno()
+                self.saved = termios.tcgetattr(self.fd)
+                tty.setcbreak(self.fd)
+        except Exception:
+            self.fd = None          # no terminal, no keys, no complaint
+
+    @property
+    def live(self) -> bool:
+        return self.fd is not None
+
+    def read(self) -> str:
+        if self.fd is None:
+            return ""
+        try:
+            if select.select([sys.stdin], [], [], 0)[0]:
+                return os.read(self.fd, 32).decode(errors="replace").lower()
+        except Exception:
+            pass
+        return ""
+
+    def close(self) -> None:
+        if self.fd is not None and self.saved is not None:
+            try:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+            except Exception:
+                pass
+
+
 def block_out(mask, boxes):
     """Punch detector boxes into the mask as not-floor.
 
@@ -1248,6 +1297,11 @@ def main() -> int:
     last_view = 0.0
     view_period = 1.0 / max(0.1, args.stream_fps)
 
+    keys = Keys()
+    if keys.live and car is not None:
+        print("  camera:  t raise   g lower   b back to driving angle   "
+              "v limp\n")
+
     detector = reporter = None
     if args.detect:
         try:
@@ -1290,6 +1344,27 @@ def main() -> int:
                 time.sleep(0.005)
                 continue
             next_tick = max(now + period, next_tick + period)
+
+            # Aim the camera by hand while it drives. The mast angle is
+            # the one perception setting you cannot judge from a number
+            # — it has to be looked at — so being able to move it
+            # against the live view without stopping the run is worth
+            # the few lines. Nothing here touches the tracks.
+            for key in keys.read():
+                if car is None or key not in ("t", "g", "b", "v"):
+                    continue
+                try:
+                    if key == "b":
+                        car.camera_up(settle=0.0)
+                        say(f"  camera back to driving angle {Car.MAST_UP}")
+                    elif key == "v":
+                        car.mast(-1)
+                        say("  camera limp")
+                    else:
+                        step = Keys.MAST_STEP if key == "t" else -Keys.MAST_STEP
+                        say(f"  camera {car.mast_nudge(step)} deg")
+                except Exception as e:
+                    say(f"  camera failed: {e}")
 
             # Drain the detector BEFORE deciding anything, so a box that
             # has just arrived blocks on this tick rather than the next
@@ -1424,6 +1499,7 @@ def main() -> int:
     finally:
         # Camera first: lowering the mast is a bridge command, so the
         # bridge has to still be open when it goes out.
+        keys.close()
         if detector is not None:
             detector.close()
         if view is not None:

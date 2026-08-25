@@ -61,11 +61,13 @@ BACK_ARCS = {"z": "left", "c": "right"}
 # load draws current for as long as it is asked to hold.
 MAST_STEP = 5
 MAST = {
-    "t": "up",
-    "g": "down",
+    # t and g nudge, they are not presets. Aiming the camera is a
+    # thing you do by eye against the live view, a few degrees at a
+    # time, so the keys that do it most often get the easy position.
+    "t": MAST_STEP,  "+": MAST_STEP,  "=": MAST_STEP,
+    "g": -MAST_STEP, "-": -MAST_STEP, "_": -MAST_STEP,
+    "b": "up",        # back to the driving angle, in one press
     "v": "limp",
-    "+": MAST_STEP,  "=": MAST_STEP,     # = so it works without shift
-    "-": -MAST_STEP, "_": -MAST_STEP,
 }
 
 
@@ -75,18 +77,10 @@ def mast_key(car: Car, action) -> str:
         # settle=0 because the operator is watching it move and does
         # not need the key loop to go deaf for most of a second.
         car.camera_up(settle=0.0)
-    elif action == "down":
-        car.camera_down()
     elif action == "limp":
         car.mast(-1)
     else:
-        # Nudging from limp, or from never-commanded, starts at the
-        # raised preset — dialling that angle in is the only reason to
-        # nudge at all.
-        base = car.mast_angle
-        if base is None or base < 0:
-            base = Car.MAST_UP
-        car.mast(max(0, min(180, base + action)))
+        car.mast_nudge(action)
 
     angle = car.mast_angle
     if angle is None or angle < 0:
@@ -106,8 +100,8 @@ HELP = """
   space  stop       x  quit
   r      unstick    i  show config and relay operation counts
 
-  t  mast up        g  mast down       v  mast limp
-  +/-  nudge the mast 5 deg, to dial in the raised angle
+  t  camera up       g  camera down     5 deg a press
+  b  back to the driving angle            v  mast limp
 
   l  look around: stop, raise the mast, say what the model sees
      (needs --detect; --stream serves the same view roam would use)

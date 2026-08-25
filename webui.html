@@ -139,6 +139,17 @@
     <button data-move="arc_right">arc&nbsp;&rarr;<small>D</small></button>
     <button id="estop">STOP EVERYTHING<small>space</small></button>
   </div>
+
+  <!-- Camera aim. Separate from the drive pad on purpose: these are
+       the only buttons on the page that work in every mode, roaming
+       included, because they cannot move the tank. -->
+  <div id="mast">
+    <span class="lbl">camera <b id="s-mast">&mdash;</b></span>
+    <button data-mast="raise">raise<small>T</small></button>
+    <button data-mast="lower">lower<small>G</small></button>
+    <button data-mast="up">driving<small>B</small></button>
+    <button data-mast="limp">limp<small>V</small></button>
+  </div>
 </div>
 
 <div class="panel">
@@ -249,11 +260,29 @@ document.querySelectorAll("#pad button[data-move]").forEach(b => {
 const KEYS = {KeyW:"forward", KeyS:"reverse", KeyA:"arc_left", KeyD:"arc_right",
               KeyQ:"soft_arc_left", KeyE:"soft_arc_right"};
 
+// Aiming the camera is a tap, not a hold: each press moves it a fixed
+// step, so there is no lease to renew and nothing to release. Key
+// repeat is allowed through for these, which makes holding T sweep.
+const MAST_KEYS = {KeyT:"raise", KeyG:"lower", KeyB:"up", KeyV:"limp"};
+
+function mast(action){
+  post("/api/mast", {action}).then(r => {
+    if (r && r.ok) setMast(r.mast);
+  });
+}
+function setMast(a){
+  const el = document.getElementById("s-mast");
+  if (el) el.textContent = (a === null || a === undefined) ? "limp" : a + "\u00b0";
+}
+document.querySelectorAll("#mast button").forEach(b =>
+  b.addEventListener("click", () => mast(b.dataset.mast)));
+
 addEventListener("keydown", e => {
   if (e.target.matches("input,select,textarea")) return;
   if (e.code === "Space"){ e.preventDefault(); estop(); return; }
   // repeat is ignored: a browser reports the release, so unlike the
   // terminal there is nothing to infer from key repeat.
+  if (MAST_KEYS[e.code]){ e.preventDefault(); mast(MAST_KEYS[e.code]); return; }
   if (e.repeat || !KEYS[e.code]) return;
   e.preventDefault();
   startHold(KEYS[e.code]);
@@ -280,6 +309,15 @@ $("#estop").addEventListener("click", estop);
 
 function paintState(s){
   if (!s) { $("#s-move").textContent = "no link"; return; }
+  // Everything below reads fields off s. A single missing one throws,
+  // and the throw lands in the .catch on the poll, which paints "no
+  // link" — so one absent key looks exactly like a dead server. Fill
+  // the gaps instead, and let a real fetch failure keep that message
+  // to itself.
+  s.regs = s.regs || [0,0,0];
+  s.detections = s.detections || [];
+  s.reason = s.reason || "";
+  s.move = s.move || "—";
   if (s.mode !== mode && held === null){ mode = s.mode; paintMode(); }
 
   $("#s-move").textContent   = s.move;
@@ -301,6 +339,7 @@ function paintState(s){
   $("#s-lease").textContent = s.lease > 0 ? s.lease.toFixed(1)+"s left" : "idle";
   $("#s-lease").className = s.lease > 0 ? "" : "off";
 
+  setMast(s.mast);
   if (s.notice) $("#notice").textContent = s.notice;
 }
 
