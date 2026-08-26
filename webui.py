@@ -71,7 +71,8 @@ from record import CAMERA_ROTATION, Camera
 from roam import (LowBattery, add_lowbattery_args,
                   FloorModel, Policy, Smoother, add_detect_args,
                   add_perception_args, add_view_args, annotate, blocking_boxes,
-                  free_profile, marks_for, perceive, shrink, tracks_for)
+                  free_profile, marks_for, perceive, shrink,
+                  tracks_for, why_blocked)
 
 # Moves the page may ask for by hand. A deliberate subset of what the
 # policy can produce: no soft_back_*, because a reverse arc is what a
@@ -421,15 +422,28 @@ class Controller:
             if now - last_view >= 1.0 / max(0.1, self.args.stream_fps):
                 last_view = now
                 try:
+                    # Keywords, not position. This was passing the
+                    # policy's reason string into `reasons`, which is a
+                    # dict of per-box gate explanations, and the
+                    # .get() on it killed the control thread — the
+                    # relays then went out on the watchdog, which is
+                    # the safe outcome of a failure that should not
+                    # have been possible from drawing code.
                     self.slot.update(annotate(
-                        frame, mask, prof, regs, move, self.marks, shown,
-                        self.args.small_object, now - shown_at, blocks,
-                        getattr(self.policy, "reason", "")))
-                except TypeError:
-                    # annotate's tail arguments have moved before now.
-                    # A live view is worth more than an exact overlay,
-                    # so fall back rather than kill the control loop.
+                        frame, mask, prof, regs, move,
+                        marks=self.marks, dets=shown,
+                        small_max=self.args.small_object,
+                        det_age=now - shown_at, blocking=blocks,
+                        reasons={tuple(d.box): why_blocked(
+                            d, now - shown_at, self.args) for d in shown},
+                        reason=reason))
+                except Exception as e:
+                    # Anything at all. A live view is worth having and
+                    # worth nothing next to the tank still answering
+                    # its controls, so the overlay is allowed to fail
+                    # and the loop is not allowed to notice.
                     self.slot.update(frame)
+                    self.notice = f"overlay failed: {e}"
 
     # ------------------------------------------------------- report
 

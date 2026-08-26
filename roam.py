@@ -732,7 +732,7 @@ class Smoother:
 
 def annotate(bgr, mask, prof, regs, move, marks=(), dets=(),
              small_max: float = 1.0, det_age: float = 0.0, blocking=(),
-             reasons=None):
+             reasons=None, reason: str = ""):
     """Draw what the policy is looking at, over the frame it looked at.
 
     marks are horizontal reference lines — the thresholds the numbers
@@ -793,7 +793,7 @@ def annotate(bgr, mask, prof, regs, move, marks=(), dets=(),
         tag = f"{d.label} {d.confidence:.0%}"
         if vetoing:
             tag += "  BLOCKING"
-        elif reasons and reasons.get(tuple(d.box)):
+        elif isinstance(reasons, dict) and reasons.get(tuple(d.box)):
             tag += f"  passed: {reasons[tuple(d.box)]}"
         elif not reported:
             tag += f"  {d.area_frac:.0%} of frame"
@@ -815,6 +815,10 @@ def annotate(bgr, mask, prof, regs, move, marks=(), dets=(),
         out, move, (8, h - 10),
         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
     )
+    if reason:
+        (mw, _), _ = cv2.getTextSize(move, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cv2.putText(out, reason, (14 + mw, h - 11),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 210, 210), 1)
     return out
 
 
