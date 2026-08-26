@@ -1,6 +1,4 @@
  python roam.py --min-obstacle 8 --close 20 --go 0.62 --commit-above 0.75 --even-above 0.65  --min-interval 0.2 --stream 8080  --detect yolo11n.onnx --floor-model hallwayfloor.npz --horizon 0.3 --detect-every 1.5 --window 3 --block-conf 0.35 --block-min-area 0.003 
 
 
-ssh -N -L 8080:localhost:8080 kitchen-helper@rover.local
-
 
