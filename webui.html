@@ -118,6 +118,7 @@
       <tr><td>clear L/C/R</td><td id="s-regs">&mdash;</td></tr>
       <tr><td>go above</td><td id="s-go">&mdash;</td></tr>
       <tr><td>relays</td><td id="s-relays">&mdash;</td></tr>
+      <tr><td>low battery</td><td id="s-lowbat" class="off">off</td></tr>
       <tr><td>loop</td><td id="s-fps">&mdash;</td></tr>
       <tr><td>reversals</td><td id="s-rev">0</td></tr>
       <tr><td>bridge resets</td><td id="s-resets">0</td></tr>
@@ -143,6 +144,14 @@
   <!-- Camera aim. Separate from the drive pad on purpose: these are
        the only buttons on the page that work in every mode, roaming
        included, because they cannot move the tank. -->
+  <!-- Flat pack: one track cannot turn the tank from rest, so every
+       turn is preceded by a straight run. Live, because a pack goes
+       flat mid-session and this is the moment you want it. -->
+  <div id="lowbat">
+    <button id="lb-toggle" data-on="0">low battery: OFF</button>
+    <small>turns run up straight first</small>
+  </div>
+
   <div id="mast">
     <span class="lbl">camera <b id="s-mast">&mdash;</b></span>
     <button data-mast="raise">raise<small>T</small></button>
@@ -277,6 +286,18 @@ function setMast(a){
 document.querySelectorAll("#mast button").forEach(b =>
   b.addEventListener("click", () => mast(b.dataset.mast)));
 
+function paintLowbat(on){
+  const b = document.getElementById("lb-toggle");
+  if (!b) return;
+  b.dataset.on = on ? "1" : "0";
+  b.textContent = "low battery: " + (on ? "ON" : "OFF");
+  b.classList.toggle("on", !!on);
+}
+document.getElementById("lb-toggle").addEventListener("click", () => {
+  const want = document.getElementById("lb-toggle").dataset.on !== "1";
+  post("/api/lowbat", {on: want}).then(r => { if (r && r.ok) paintLowbat(r.lowbat); });
+});
+
 addEventListener("keydown", e => {
   if (e.target.matches("input,select,textarea")) return;
   if (e.code === "Space"){ e.preventDefault(); estop(); return; }
@@ -340,6 +361,9 @@ function paintState(s){
   $("#s-lease").className = s.lease > 0 ? "" : "off";
 
   setMast(s.mast);
+  paintLowbat(s.lowbat);
+  $("#s-lowbat").textContent = s.lowbat ? "ON — turns run up first" : "off";
+  $("#s-lowbat").className   = s.lowbat ? "" : "off";
   if (s.notice) $("#notice").textContent = s.notice;
 }
 

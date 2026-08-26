@@ -68,7 +68,8 @@ import cv2
 
 from car import BridgeError, Car, SoftArc, boot_warning
 from record import CAMERA_ROTATION, Camera
-from roam import (FloorModel, Policy, Smoother, add_detect_args,
+from roam import (LowBattery, add_lowbattery_args,
+                  FloorModel, Policy, Smoother, add_detect_args,
                   add_perception_args, add_view_args, annotate, blocking_boxes,
                   free_profile, marks_for, perceive, shrink, tracks_for)
 
@@ -200,6 +201,7 @@ class Controller:
         """(Re)make everything derived from a number the page can change."""
         a, h = self.args, self.h
         self.go_px = a.go * h
+        self.lowbat = LowBattery(a.low_battery, a.lowbat_runup)
         self.policy = Policy(self.go_px, a.commit_above * h, a.even_above * h,
                              a.turn_margin * h, a.stuck_after, a.reverse_for,
                              soft_margin=a.soft_margin * h,
@@ -327,8 +329,9 @@ class Controller:
             mode, move, until = self.mode, self.manual_move, self.manual_until
 
         if mode == "roam":
-            return self.smoother.update(self.policy.decide(*regs, now), now), \
-                self.policy.reason
+            move = self.smoother.update(self.policy.decide(*regs, now), now)
+            move = self.lowbat.filter(move, now)
+            return move, (self.lowbat.reason or self.policy.reason)
 
         if mode == "manual":
             if move is None:
@@ -443,6 +446,7 @@ class Controller:
             "reversals": getattr(self.policy, "reversals", 0),
             "resets": getattr(car, "resets", 0) if car else 0,
             "held": bool(car and car.last_command_held),
+            "lowbat": self.lowbat.enabled,
             "mast": (car.mast_angle if car and car.mast_angle is not None
                      and car.mast_angle >= 0 else None),
             "notice": notice,
@@ -589,6 +593,19 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": ok, **self.ctl.state()})
             return
 
+        if self.path == "/api/lowbat":
+            on = bool(body.get("on", False))
+            self.ctl.lowbat.enabled = on
+            # Momentum cannot be assumed across the switch: turn it on
+            # mid-roll and the tank may or may not still be moving, so
+            # make the next turn earn its run-up.
+            self.ctl.lowbat.rolling_since = None
+            self.ctl.notice = (f"low battery ON — turns need "
+                               f"{self.ctl.lowbat.run_up:.1f}s of straight first"
+                               if on else "low battery off")
+            self._json({"ok": True, "lowbat": on})
+            return
+
         if self.path == "/api/mast":
             self._json(self.ctl.mast(body.get("action", "")))
             return
@@ -637,6 +654,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="seconds a manual order survives without being "
                          "renewed by the page. The tank stops when a browser "
                          "goes quiet, whatever the reason")
+    add_lowbattery_args(ap)
     ap.add_argument("--port", default=None, help="ESP32 serial device")
     ap.add_argument("--dry-run", action="store_true",
                     help="decide and show, but never drive")

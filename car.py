@@ -706,6 +706,17 @@ class Car:
         time.sleep(settle)
         return reply
 
+    def is_rolling(self) -> bool:
+        """Is at least one track currently driven?
+
+        The nearest thing to a speed reading this tank has. It says the
+        tracks are being told to move, not that they are — a stalled
+        motor reports the same. Good enough for deciding whether a turn
+        needs a run-up, and worth nothing beyond that.
+        """
+        state = self._last_state
+        return bool(state) and any(state)
+
     def mast_nudge(self, delta: int) -> int:
         """Move the mast by delta degrees. Returns where it ended up.
 

@@ -966,6 +966,81 @@ def marks_for(args, h):
     ]
 
 
+class LowBattery:
+    """Turning needs momentum once the pack is flat.
+
+    A tracked chassis on a low pack cannot break stiction on one track
+    alone. Told to arc from a standstill it stalls the driven track,
+    sits there, and spends contact operations achieving nothing —
+    which then loads the same sagging rail that caused it. Already
+    rolling, the identical command turns it fine, because the
+    momentum does the work the motor no longer can.
+
+    So an arc is never issued from rest. A turn asked for from a
+    standstill becomes a straight run in the direction that turn was
+    going to travel anyway, held for run_up seconds, and only then the
+    turn itself.
+
+    Matching the run-up to the turn's own direction is what keeps this
+    safe. A forward arc runs up FORWARD, which is ground the policy
+    had already judged clear enough to arc across; a reverse arc runs
+    up BACKWARD, away from whatever it is escaping. Running up the
+    wrong way would mean driving into the thing being avoided in order
+    to gain the speed to avoid it.
+    """
+
+    # Which straight move builds the speed each turn needs.
+    RUN_UP = {
+        "arc_left": "forward", "arc_right": "forward",
+        "soft_arc_left": "forward", "soft_arc_right": "forward",
+        "soft_back_left": "reverse", "soft_back_right": "reverse",
+    }
+
+    def __init__(self, enabled: bool = False, run_up: float = 0.8):
+        self.enabled = enabled
+        self.run_up = run_up
+        self.rolling_since = None      # None means stopped
+        self.reason = ""
+
+    def filter(self, move: str, now: float) -> str:
+        """The move that should actually be sent."""
+        self.reason = ""
+        if not self.enabled:
+            return move
+
+        straight = self.RUN_UP.get(move)
+        if straight is None:
+            # forward, reverse and stop are what momentum is made of.
+            # A stop throws it away, so the next turn pays for a run-up
+            # again — which is correct, because it genuinely has to.
+            if move in ("forward", "reverse"):
+                if self.rolling_since is None:
+                    self.rolling_since = now
+            else:
+                self.rolling_since = None
+            return move
+
+        if self.rolling_since is not None and now - self.rolling_since >= self.run_up:
+            return move                # rolling already, turn away
+
+        if self.rolling_since is None:
+            self.rolling_since = now
+        self.reason = "run-up"
+        return straight
+
+
+def add_lowbattery_args(ap) -> None:
+    """The low-battery protocol, shared so the page and roam agree."""
+    ap.add_argument("--low-battery", action="store_true",
+                    help="never arc from a standstill. On a flat pack one track "
+                         "cannot turn the tank on its own, so every turn is "
+                         "preceded by a straight run to build the momentum that "
+                         "does it instead")
+    ap.add_argument("--lowbat-runup", type=float, default=0.8,
+                    help="seconds of straight running before a turn is allowed, "
+                         "with --low-battery on")
+
+
 class Keys:
     """Non-blocking keyboard input, when there is a keyboard.
 
@@ -1086,6 +1161,7 @@ def main() -> int:
     add_perception_args(ap)
     add_detect_args(ap)
     add_view_args(ap)
+    add_lowbattery_args(ap)
     ap.add_argument("--port", default=None, help="ESP32 serial device")
     ap.add_argument("--dry-run", action="store_true", help="decide but do not drive")
     ap.add_argument("--fps", type=float, default=10.0, help="decisions per second")
@@ -1297,6 +1373,11 @@ def main() -> int:
     last_view = 0.0
     view_period = 1.0 / max(0.1, args.stream_fps)
 
+    lowbat = LowBattery(args.low_battery, args.lowbat_runup)
+    if args.low_battery:
+        print(f"  low battery: turns need {args.lowbat_runup:.1f}s of straight "
+              f"running first; no arcs from a standstill\n")
+
     keys = Keys()
     if keys.live and car is not None:
         print("  camera:  t raise   g lower   b back to driving angle   "
@@ -1397,6 +1478,7 @@ def main() -> int:
                 detector.submit(frame, "floor")
 
             move = smoother.update(policy.decide(*regs, now), now)
+            move = lowbat.filter(move, now)
             decision = tracks_for(move, now, soft)
 
             # Resent every tick, not only when it changes. The firmware

@@ -246,6 +246,8 @@ def main() -> int:
                     help="seconds to drive backwards when r is pressed")
     ap.add_argument("--no-servo", action="store_true",
                     help="do not raise the camera mast")
+    from roam import add_lowbattery_args
+    add_lowbattery_args(ap)
     # The same flags roam uses, from the same definitions, so a value
     # tuned while driving by hand means the same thing when roam runs.
     from roam import add_perception_args, add_detect_args, add_view_args
