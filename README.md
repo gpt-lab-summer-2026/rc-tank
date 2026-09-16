@@ -19,6 +19,7 @@ An existing RC rover was used as the mechanical base, allowing the project to fo
 
 The Raspberry Pi processes the camera feed and determines the appropriate direction of movement. Commands are sent to the ESP32 over USB serial, where the firmware controls the rover's motors through the relay bridge.
 
+```text
 ┌─────────────────────┐
 │   Raspberry Pi 5    │
 │                     │
@@ -45,6 +46,7 @@ The Raspberry Pi processes the camera feed and determines the appropriate direct
       DC Motors
            │
         Rover
+```
 
 The Raspberry Pi and motor system use separate power supplies. This prevents the high stall current of the DC motors from causing voltage drops that could reset or crash the computing hardware.
 
@@ -84,6 +86,7 @@ The cause was traced to the relay module sharing the motor power supply. Residua
 
 The solution was to separate the power domains:
 
+```text
 Power Supply 1
 └── Raspberry Pi
     └── ESP32
@@ -91,6 +94,7 @@ Power Supply 1
 
 Power Supply 2
 └── DC Motors
+```
 
 This eliminated the unwanted motor activation and made the motor behavior consistent with the relay states.
 
