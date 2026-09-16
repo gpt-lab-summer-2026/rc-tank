@@ -133,8 +133,8 @@ These changes significantly improved the rover's ability to identify a navigable
 **Software**
 
 * Python
-* Computer vision / image recognition
-* Object detection
+* Computer vision / image recognition OPENCV
+* Object detection YOLO11
 * ESP32 firmware
 * USB serial communication
 
